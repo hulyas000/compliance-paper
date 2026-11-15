@@ -2,7 +2,7 @@
 
 **Normative compliance among young people: institutional anomie, procedural justice and situational action in the Istanbul ISRD-3 data**
 
-This document sets out the analytic strategy before the revised models are run. It replaces version 1, which was written before the submission to the *Journal of Research in Crime and Delinquency* and the reviews that followed. Version 2 changes the theoretical framing, the measurement of the three theories, the serious-offending outcome, and the treatment of clustering, missing data and age. A change log at the end records every departure from version 1 and the reason for it.
+This document sets out the analytic strategy before the revised models are run. It replaces version 1, which was written before the submission to the *...* and the reviews that followed. Version 2 changes the theoretical framing, the measurement of the three theories, the serious-offending outcome, and the treatment of clustering, missing data and age. A change log at the end records every departure from version 1 and the reason for it.
 
 Version 1 results are already known to us. The hypotheses below are therefore not preregistered in the strict sense. Each is derived from the theory and from the ISRD-3 design documents (Marshall et al., 2013; ISRD3 Working Group, 2013), and the source of each is stated so that readers can judge this for themselves.
 
