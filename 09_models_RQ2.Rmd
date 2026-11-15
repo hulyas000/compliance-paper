@@ -1,0 +1,125 @@
+---
+title: "09 · RQ2 models — offence type (H1, H2, H4) and gender (H6) (analysis plan v2, 8.4)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages(c("logistf", "marginaleffects"))
+library(here); library(tidyverse); library(mice); library(logistf); library(marginaleffects)
+source(here("notebooks", "build_vars.R")); source(here("notebooks", "model_helpers.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+```{r data}
+mi  <- read_rds(here("data", "processed", "isrd3_g9_mice.rds"))
+p4  <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+p4  <- p4 |> transmute(caseid,
+  z_prosoc4 = as.numeric(scale(num(prosoc4))),                       # act-specific item for downloading
+  MOR7 = as.numeric(scale(scale_mean(p4, paste0("prosoc", c(1:3, 5:8))))))  # morality without the download item
+imp_list <- complete(mi$imp, "all") |>
+  map(\(d) d |> left_join(mi$miss_flags, by = "caseid") |> left_join(p4, by = "caseid") |> prep())
+
+mech  <- c(blk$PJT, blk$IAT, blk$SAT)                      # all theory terms
+mech_i <- c(blk$PJT, "NTS_wth", blk$SAT)                   # individual-level theory terms
+terms_full <- c(ctrl, mech)
+```
+
+## Stacked models (property vs violent)
+Individual-level variables are allowed to differ by type; region and school type are shared, to avoid
+separation in small strata. Random intercepts for respondent and class.
+```{r stacked}
+by_type <- c(mech_i, "NTS_cls", "male", "deprfam", "SCHB", "PEERD")   # class-level NTS also tested by type (H1)
+shared  <- c("region", "schtype")
+f_stack <- as.formula(paste("y ~ type * (", paste(by_type, collapse = " + "), ") +",
+                            paste(shared, collapse = " + "), "+ (1 | caseid) + (1 | classid)"))
+
+make_long <- function(d) d |>
+  filter(!miss_prop_any %in% TRUE, !miss_viol_any %in% TRUE) |>
+  pivot_longer(c(prop_any, viol_any), names_to = "type", values_to = "y") |>
+  mutate(type = factor(type, levels = c("prop_any", "viol_any")))
+
+fits_stack <- map(imp_list, \(d) glmmTMB(f_stack, data = make_long(d), family = binomial()))
+
+# H1, H2, H4: does the mechanism differ between property and violent offending?
+type_diff <- rubin(fits_stack) |> filter(str_detect(term, "^typeviol_any:")) |>
+  mutate(mechanism = str_remove(term, "^typeviol_any:"), .before = 1)
+
+# slopes within each type (odds ratios per SD)
+type_slopes <- map_dfr(by_type, \(v) bind_rows(
+  lincomb_pool(fits_stack, v) |> mutate(type = "property"),
+  lincomb_pool(fits_stack, c(v, paste0("typeviol_any:", v))) |> mutate(type = "violent")) |>
+  mutate(mechanism = v, .before = 1))
+type_diff; type_slopes
+```
+
+## Separate models (property also by Firth)
+```{r separate}
+fits_prop <- map(imp_list, \(d) fitm(d, "prop_any", terms_full))
+fits_viol <- map(imp_list, \(d) fitm(d, "viol_any", terms_full))
+fits_firth <- map(imp_list, \(d) logistf(reformulate(terms_full, "prop_any"),
+                                         data = drop_imputed_y(d, "prop_any")))
+firth <- rubin_cv(map(fits_firth, coef), map(fits_firth, vcov))
+
+separate <- bind_rows(rubin(fits_prop) |> mutate(model = "property, multilevel"),
+                      firth            |> mutate(model = "property, Firth (single level)"),
+                      rubin(fits_viol) |> mutate(model = "violent, multilevel")) |>
+  filter(term %in% mech)
+separate
+```
+
+## Class-level NTS on property offending, leaving out one class at a time
+```{r loco}
+d1   <- drop_imputed_y(imp_list[[1]], "prop_any")
+loco <- map_dfr(unique(d1$classid), \(c) {
+  f <- tryCatch(fit_glmm(filter(d1, classid != c), "prop_any", terms_full), error = \(e) NULL)
+  if (is.null(f)) return(NULL)
+  s <- summary(f)$coefficients$cond["NTS_cls", ]
+  tibble(left_out = c, b = s[1], se = s[2], p = s[4]) })
+loco_summary <- loco |> summarise(n = n(), b_min = min(b), b_max = max(b), p_max = max(p))
+loco_summary
+```
+
+## Illagal downloading with its matching morality item
+```{r download}
+# MOR7 replaces MOR: the full scale contains the download item, which would put the item in the model twice
+terms_dl <- c(setdiff(terms_full, "MOR"), "MOR7", "z_prosoc4")
+fits_dl  <- map(imp_list, \(d) fitm(d, "download_any", terms_dl))
+download <- rubin(fits_dl) |> filter(term %in% c(mech, "MOR7", "z_prosoc4"))
+download
+```
+
+## Mechanism × sex on versatility
+```{r gender}
+terms_g   <- c(terms_full, paste0(mech_i, ":male"))
+fits_full <- map(imp_list, \(d) fitm(d, "off_vers", terms_full))
+fits_g    <- map(imp_list, \(d) fitm(d, "off_vers", terms_g))
+
+gender_block <- lr_pool(fits_g, fits_full)                         # all interactions together
+gender_int   <- rubin(fits_g) |> filter(str_detect(term, ":male|male:")) |>   # R may name it male:LEG
+  mutate(mdd = 2.8 * se)          # smallest difference (log scale) detectable with 80% power at .05
+
+# average marginal effects by sex (expected number of offence types per SD; population level)
+ame_list <- map(fits_g, \(f) avg_slopes(f, variables = mech_i, by = "male", re.form = NA) |>
+                  as_tibble() |> select(term, male, estimate, std.error))
+gender_ame <- bind_rows(ame_list, .id = "imp") |>
+  group_by(term, male) |>
+  summarise(m = n(), est = mean(estimate), B = var(estimate), W = mean(std.error^2), .groups = "drop") |>
+  mutate(se = sqrt(W + (1 + 1/m) * B), lo = est - 1.96 * se, hi = est + 1.96 * se,
+         sex = if_else(male == 1, "boys", "girls")) |>
+  select(term, sex, est, se, lo, hi)
+gender_block; gender_int; gender_ame
+```
+
+## Output
+```{r export}
+r3 <- \(x) mutate(x, across(where(is.numeric), \(v) round(v, 3)))
+write_csv(r3(type_diff),   here("output", "tables", "rq2_type_diff_v2.csv"))
+write_csv(r3(type_slopes), here("output", "tables", "rq2_type_slopes_v2.csv"))
+write_csv(r3(separate),    here("output", "tables", "rq2_separate_v2.csv"))
+write_csv(r3(download),    here("output", "tables", "rq2_download_v2.csv"))
+write_csv(r3(bind_rows(gender_block |> mutate(term = "all mechanism x sex"), gender_int)),
+          here("output", "tables", "rq2_gender_int_v2.csv"))
+write_csv(r3(gender_ame),  here("output", "tables", "rq2_gender_ame_v2.csv"))
+write_csv(r3(loco_summary), here("output", "tables", "rq2_loco_v2.csv"))
+```

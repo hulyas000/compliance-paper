@@ -1,0 +1,121 @@
+---
+title: "05 · Descriptives, ICCs and missingness (analysis plan v2, section 8.1)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages("lme4")
+library(here); library(tidyverse); library(lme4)
+source(here("notebooks", "build_vars.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load}
+g9 <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+```
+
+## 1. Intra-class correlations (classid)
+```{r icc}
+# binary outcomes: latent-scale ICC = tau2 / (tau2 + pi^2/3); continuous: tau2 / (tau2 + sigma2)
+icc_bin  <- function(y) { f <- glmer(reformulate("(1 | classid)", y), g9, family = binomial)
+  t2 <- as.numeric(VarCorr(f)$classid); t2 / (t2 + pi^2 / 3) }
+icc_cont <- function(y) { f <- lmer(reformulate("(1 | classid)", y), g9)
+  vc <- as.data.frame(VarCorr(f)); vc$vcov[1] / sum(vc$vcov) }
+
+bin_y  <- c("prop_any","viol_any","oth_any","serious_any","download_any")
+cont_y <- c("off_vers","NTS_prof","NTS_shop","LEG","PJ","EFF","MOR","SC",
+            "SHAME_shop","SHAME_hurt","FAMB","SCHB","PEERD")
+icc <- bind_rows(
+  tibble(variable = bin_y,  type = "binary (latent)", icc = map_dbl(bin_y,  icc_bin)),
+  tibble(variable = cont_y, type = "continuous",      icc = map_dbl(cont_y, icc_cont))) |>
+  mutate(icc = round(icc, 3))
+icc
+```
+
+## 2. Prevalence by gender
+```{r prevalence}
+prev <- g9 |> filter(!is.na(male)) |>
+  group_by(sex = if_else(male == 1, "boys", "girls")) |>
+  summarise(n = n(), across(all_of(bin_y), \(x) sum(x == 1, na.rm = TRUE), .names = "{.col}_n"),
+            across(all_of(bin_y), \(x) round(mean(x, na.rm = TRUE) * 100, 1), .names = "{.col}_pct"))
+prev
+```
+
+## 3. Correlations among predictors
+```{r correlations}
+preds <- c("LEG","PJ","PJ_EQUAL","EFF","NTS_prof","NTS_shop","MOR","SHAME_shop","SHAME_hurt",
+           "SHAME_arrest","SC","FAMB","SCHB","PEERD","male","deprfam")
+cor_m <- round(cor(g9[preds], use = "pairwise.complete.obs"), 2)
+cor_m
+```
+
+## 4. Missingness patterns
+```{r missing}
+model_vars <- c("off_vers","LEG","PJ","PJ_EQUAL","EFF","NTS_prof","MOR","SHAME_shop","SHAME_hurt",
+                "SC","male","deprfam","SCHB","PEERD")
+g9$n_miss  <- rowSums(is.na(g9[model_vars]))
+g9$complete <- as.integer(g9$n_miss == 0)
+
+miss <- tibble(
+  stat  = c("complete cases", "cases missing 1", "cases missing 2+",
+            "offending (off_vers) complete vs incomplete", "male % complete vs incomplete",
+            "family bond missing: father item blank", "family bond missing: mother item blank"),
+  value = c(sum(g9$complete), sum(g9$n_miss == 1), sum(g9$n_miss >= 2),
+            sprintf("%.2f vs %.2f", mean(g9$off_vers[g9$complete == 1], na.rm = TRUE),
+                                    mean(g9$off_vers[g9$complete == 0], na.rm = TRUE)),
+            sprintf("%.1f vs %.1f", 100 * mean(g9$male[g9$complete == 1], na.rm = TRUE),
+                                    100 * mean(g9$male[g9$complete == 0], na.rm = TRUE)),
+            sum(is.na(g9$FAMB) & is.na(g9$fambond1)), sum(is.na(g9$FAMB) & is.na(g9$fambond2))))
+miss
+```
+
+## 5. Compact output to send
+```{r export}
+write_csv(icc,  here("output", "tables", "icc_v2.csv"))
+write_csv(prev, here("output", "tables", "prevalence_by_sex_v2.csv"))
+write_csv(as_tibble(cor_m, rownames = "variable"), here("output", "tables", "predictor_cor_v2.csv"))
+write_csv(miss, here("output", "tables", "missing_v2.csv"))
+```
+
+## Honesty checks and crosswise estimate (Methods, measurement of offending)
+```{r crosswise}
+library(survey)
+ist <- read_rds(here("data", "processed", "isrd3_istanbul.rds"))
+an  <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+g9_all <- ist |> filter(num(grade) == 9)                       # all grade 9, before screening
+
+# 1. Relevin and non-disclosure: all grade 9 (Relevin was one of the screening flags)
+honesty <- g9_all |> summarise(
+  n            = n(),
+  relevin_n    = sum(num(releltp) == 1, na.rm = TRUE),
+  relevin_pct  = 100 * mean(num(releltp) == 1, na.rm = TRUE),
+  nondisc_n    = sum(num(openness) == 1, na.rm = TRUE),
+  nondisc_pct  = 100 * mean(num(openness) == 1, na.rm = TRUE))
+honesty_screened <- g9_all |> filter(caseid %in% an$caseid) |>
+  summarise(n = n(), nondisc_pct = 100 * mean(num(openness) == 1, na.rm = TRUE))
+
+# 2. Crosswise estimate: screened sample, students who answered the crosswise item
+cw <- g9_all |> filter(caseid %in% an$caseid, !is.na(crossov)) |>
+  mutate(B      = as.numeric(num(crossov) == 2),              # 2 = answers differ
+         direct = as.numeric(rowSums(across(c(shoplyp, extolyp, asltlyp, burglyp),
+                                            \(x) num(x) > 0), na.rm = TRUE) > 0))
+des <- svydesign(ids = ~classid, data = cw)                   # SEs allow for clustering in classes
+
+cw_est <- function(p) {
+  lam <- svymean(~B, des); l <- coef(lam); se_l <- SE(lam)
+  pi  <- (l - p) / (1 - 2 * p); se <- se_l / abs(1 - 2 * p)
+  tibble(p = p, n = nrow(cw), lambda = l, est = 100 * pi,
+         lo = 100 * (pi - 1.96 * se), hi = 100 * (pi + 1.96 * se))
+}
+dir <- svymean(~direct, des)
+crosswise <- bind_rows(cw_est(.25), cw_est(.30)) |>
+  mutate(direct = 100 * coef(dir), direct_lo = 100 * (coef(dir) - 1.96 * SE(dir)),
+         direct_hi = 100 * (coef(dir) + 1.96 * SE(dir)))
+
+write_csv(mutate(honesty, across(where(is.numeric), \(v) round(v, 2))),
+          here("output", "tables", "honesty_checks_v2.csv"))
+write_csv(mutate(crosswise, across(where(is.numeric), \(v) round(v, 2))),
+          here("output", "tables", "crosswise_v2.csv"))
+honesty; honesty_screened; crosswise
+```
+

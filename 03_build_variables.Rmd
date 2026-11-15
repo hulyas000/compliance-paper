@@ -1,0 +1,97 @@
+---
+title: "03 · Build variables (analysis plan v2) — replaces 03_itemPrep_DV and 04_scales_reliability"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(here); library(tidyverse); library(labelled); library(psych)
+source(here("notebooks", "build_vars.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the screened grade-9 sample
+```{r load}
+g9 <- read_rds(here("data", "processed", "isrd3_g9_screened.rds"))   # 1,185 after screening
+
+# same near-empty rule as before: drop respondents missing 24+ measurement items
+meas <- c("pjduty","pjattri1","pjattri2","pjattri3","pjbribes",
+          "pjresp","pjfair","pjexpl",
+          paste0("profsn", c("fr","cm","mo","fa","te","pe")),
+          paste0("shopsn", c("fr","cm","mo","fa","te","pe")),
+          paste0("prosoc", 1:8), sprintf("selfc%02d", 1:9))
+g9 <- g9 |> filter(rowSums(is.na(across(all_of(meas)))) < 24)
+nrow(g9)   # expect 1,181
+
+# every variable the plan needs must exist
+missing_vars <- setdiff(needed_vars(), names(g9))
+missing_vars   # should be character(0)
+```
+
+## Equal-treatment coding (q10.1)
+```{r equal-code}
+val_labels(g9$pjdiscr)
+# set equal_code to the value labelled "Yes, everyone is treated equally"
+equal_code <- 0   # 0 = "equally"
+stopifnot(!is.na(equal_code))
+```
+
+## Build outcomes and predictors
+```{r build}
+g9 <- g9 |> build_outcomes() |> build_measures(equal_code = equal_code)
+```
+
+## Reliability, overall and by gender
+```{r reliability}
+scales <- list(
+  PJ           = c("pjresp","pjfair","pjexpl"),
+  LEG          = paste0("z_", c("pjduty","pjattri1","pjattri2","pjattri3","pjbribes_r")),
+  LEG_nolaw    = paste0("z_", c("pjduty","pjattri1","pjattri2","pjattri3")),
+  FAMB         = paste0("fambond", 1:4),
+  TEAB         = c("teabond1","teabond2"),
+  FRDB         = c("frdbond1","frdbond2"),
+  MOR          = paste0("prosoc", 1:8),
+  SC           = sprintf("selfc%02d", 1:9),
+  SHAME_shop   = c("shamfrd1","shamtea1","shampar1"),
+  SHAME_hurt   = c("shamfrd2","shamtea2","shampar2"),
+  SHAME_arrest = c("shamfrd3","shamtea3","shampar3"),
+  SCHB         = paste0("schbond", 1:4))
+
+rel <- function(d, items) {
+  M  <- sapply(items, \(v) num(d[[v]]))
+  a  <- suppressWarnings(psych::alpha(M, check.keys = FALSE, warnings = FALSE))
+  om <- if (length(items) >= 3) tryCatch(suppressWarnings(
+          psych::omega(M, nfactors = 1, plot = FALSE)$omega.tot), error = \(e) NA_real_) else NA_real_
+  tibble(k = length(items), alpha_std = round(a$total$std.alpha, 2),
+         mean_r = round(a$total$average_r, 2), omega = round(om, 2))
+}
+reliability <- bind_rows(
+  map_dfr(scales, \(s) rel(g9, s), .id = "scale") |> mutate(group = "all"),
+  map_dfr(scales, \(s) rel(filter(g9, male == 0), s), .id = "scale") |> mutate(group = "girls"),
+  map_dfr(scales, \(s) rel(filter(g9, male == 1), s), .id = "scale") |> mutate(group = "boys"))
+write_csv(reliability, here("output", "tables", "reliability_v2.csv"))
+reliability
+```
+
+## Variable summary
+```{r summary}
+built <- c("off_vers","off_vers_upper","prop_any","viol_any","oth_any","serious_any",
+           "serious_upper","serious_freq","download_any",
+           "PJ","PJ_EQUAL","EFF","LEG","LEG_nolaw",
+           "NTS_prof","NTS_prof_par","NTS_prof_tea","NTS_prof_frd","NTS_prof_cls",
+           "NTS_shop","NTS_shop_par","NTS_shop_tea","NTS_shop_frd","NTS_shop_cls",
+           "NTS_prof_inst","NTS_prof_inst_cls","NTS_shop_inst","NTS_shop_inst_cls",
+           "SN_prof_cm","SN_prof_pe","SN_shop_cm","SN_shop_pe","NO_FRGROUP",
+           "MOR","SHAME_shop","SHAME_hurt","SHAME_arrest","SC","SC_imp","SC_risk","SC_self",
+           "male","deprfam","FAMB","SCHB","PEERD","over_age")
+var_summary <- map_dfr(built, \(v) { x <- g9[[v]]
+  tibble(variable = v, n = sum(!is.na(x)), pct_missing = round(mean(is.na(x)) * 100, 1),
+         mean = round(mean(x, na.rm = TRUE), 3), sd = round(sd(x, na.rm = TRUE), 3),
+         min = round(min(x, na.rm = TRUE), 3), max = round(max(x, na.rm = TRUE), 3)) })
+write_csv(var_summary, here("output", "tables", "var_summary_v2.csv"))
+print(var_summary, n = Inf)
+```
+
+## Save
+```{r save}
+write_rds(g9, here("data", "processed", "isrd3_g9_analysis.rds"))
+```

@@ -1,0 +1,121 @@
+---
+title: "02 · Screening — careless / invalid responding"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages("careless")
+library(here); library(haven); library(tidyverse); library(careless)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load grade-9 analytic sample
+
+```{r load}
+ist <- read_rds(here("data", "processed", "isrd3_istanbul.rds"))
+g9  <- ist |> filter(grade == 9)
+```
+
+## Two built-in ISRD validity items
+Relevin is a fake-drug and only 11 children said yes, not many overdoer. relevin is one of the flags - careless -. openness is another validity item in the questionery. it helps to measure hiding behavior. its not a flag for careless answers but it will help to discuss self reporting rate and sensitivity.
+
+```{r bogus}
+# Relevin: claiming a fake drug = over-reporting -> careless flag.
+g9 <- g9 |> mutate(flag_relevin = as.integer(as.numeric(releltp) == 1))
+
+# Non-disclosure is social desirability, not carelessness: keep it as a rate
+# and a sensitivity marker, not a deletion flag.
+g9 <- g9 |> mutate(nondiscloser = as.integer(as.numeric(openness) == 1))
+ist |> summarise(relevin_pct = mean(as.numeric(releltp) == 1, na.rm = TRUE) * 100,
+                 nondisc_pct = mean(as.numeric(openness) == 1, na.rm = TRUE) * 100)
+```
+
+## Three post-hoc indices on the Likert batteries
+these are calculated from answering pattern. Ls is for the longest straight line answers. most of the children have straigth lines 8 to 12 answeres, but one of them answered same box 32 times. ps is for consistency, there are some items that the answers should follow each other to provide consistency, median is 0.76, most of them are consistent, the tail -0.51 careless/incosistant. md is for multivariate discongruity, to what extent a child's answers variate from mean, median is 28, but there is an outlier to 404. LS, PS, MD are another flags.
+```{r indices}
+# One coherent block of ordinal items, kept in subscale order so even-odd
+# can split each scale. 0-10 and binary items are left out on purpose.
+sc_items  <- sprintf("selfc%02d", 1:9); mor_items <- paste0("prosoc", 1:8)
+iat_items <- c(paste0("profsn", c("fr","cm","mo","fa","te","pe")),
+               paste0("shopsn", c("fr","cm","mo","fa","te","pe")))
+pj_items  <- c("pjresp","pjfair","pjexpl","pjattri1","pjattri2","pjattri3")
+block <- c(sc_items, mor_items, iat_items, pj_items)
+L <- g9 |> select(all_of(block)) |> mutate(across(everything(), as.numeric))
+
+g9 <- g9 |>
+  mutate(ls = longstring(L),
+         ps = psychsyn(L, critval = 0.60),   # replaces even-odd (unstable with 4 factors)
+         md = mahad(L, flag = FALSE, plot = FALSE, na.rm = TRUE))
+summary(select(g9, ls, ps, md))              # if ps is mostly NA, drop critval to 0.50
+```
+
+## Cut-points and the convergent flag
+now we have 5 flags: relevin, ls, ps, md, and qrating from the coder.
+```{r flags}
+quantile(g9$ls, c(.90, .95, .975, .99), na.rm = TRUE)   # pick ls_cut from the tail
+ls_cut <- 16                                            # tune to the natural break
+ps_cut <- quantile(g9$ps, 0.05, na.rm = TRUE)           # least consistent tail
+md_cut <- qchisq(0.999, df = ncol(L))                   # ~66.6
+
+g9 <- g9 |>
+  mutate(flag_ls  = as.integer(ls >= ls_cut),
+         flag_ps  = as.integer(ps <= ps_cut),
+         flag_md  = as.integer(md >= md_cut),
+         flag_qr2 = as.integer(as.numeric(qrating) == 2),
+         n_flags  = rowSums(across(c(flag_relevin, flag_ls, flag_ps, flag_md, flag_qr2)),
+                            na.rm = TRUE))
+```
+
+
+## Report and remove
+if qrating == 3, that is a hard drop because coder says its unusable, for the rest of the participant there must be 2 or more independent flags to be eliminated.
+```{r screen}
+# How many each indicator catches, and the convergence distribution.
+g9 |> summarise(across(c(flag_relevin, flag_ls, flag_ps, flag_md, flag_qr2),
+                       ~ sum(.x, na.rm = TRUE)))   # how many each catches
+count(g9, n_flags)                                  # convergence distribution
+count(g9, qrating)
+
+# "not usable" = explicit coder verdict -> hard drop. Everyone else: >= 3 flags.
+g9_screened <- g9 |> filter(!(as.numeric(qrating) %in% 3), n_flags < 2)
+c(before = nrow(g9), after = nrow(g9_screened), removed = nrow(g9) - nrow(g9_screened))
+write_rds(g9_screened, here("data", "processed", "isrd3_g9_screened.rds"))
+```
+
+## table - combination of flags for each excluded cases
+```{r}
+flagcols <- c("flag_relevin","flag_ls","flag_ps","flag_md","flag_qr2")
+labels   <- c("relevin","ls","ps","md","qr2")
+
+# Which combination did each removed case trip?
+combo_tbl <- g9 |>
+  filter(n_flags >= 2) |>
+  rowwise() |>
+  mutate(combo = paste(labels[c_across(all_of(flagcols)) %in% 1], collapse = " + ")) |>
+  ungroup() |>
+  count(n_flags, combo, name = "cases") |>
+  arrange(desc(n_flags), desc(cases))
+
+combo_tbl
+sum(combo_tbl$cases)   # sanity: should be 54
+
+# Among the 54 removed, how often each indicator appears (marginal)
+g9 |> filter(n_flags >= 2) |>
+  summarise(across(all_of(flagcols), ~ sum(.x, na.rm = TRUE)))
+```
+
+
+## Aggregate cross-check — crosswise model (not a per-case flag)
+this is to check relaibility of self report. crosswise question estimates the prevelance as %38.9, the self report rate from the answers is %11.5. So, the actual crime could be around 3 times of the self reported rate.
+```{r crosswise}
+# crossov [12.1]: 1 = A (answers same), 2 = B (answers differ).
+# Aggregate cross-check on the direct self-report, not a per-case flag.
+p      <- 0.25
+lambda <- mean(as.numeric(g9$crossov) == 2, na.rm = TRUE)   # P(option B)
+pi_cw  <- (lambda - p) / (1 - 2 * p)
+direct <- g9 |>
+  transmute(any = as.integer(rowSums(across(c(shoplyi, extolyi, asltlyi, burglyi),
+                                            ~ as.numeric(.) > 0), na.rm = TRUE) > 0)) |>
+  summarise(mean(any, na.rm = TRUE)) |> pull()
+c(crosswise = pi_cw, direct = direct)   # direct << crosswise => under-reporting
+```

@@ -1,0 +1,71 @@
+---
+title: "07 · RQ1 models — theory blocks and morality × self-control (analysis plan v2, 8.3 and 8.6)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(here); library(tidyverse); library(mice)
+source(here("notebooks", "build_vars.R")); source(here("notebooks", "model_helpers.R"))   # prep, ctrl, blk, fitm, rubin, lr_pool
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data: imputed (main) and complete-case (comparison)
+```{r data}
+mi       <- read_rds(here("data", "processed", "isrd3_g9_mice.rds"))
+imp_list <- complete(mi$imp, "all") |> map(\(d) d |> left_join(mi$miss_flags, by = "caseid") |> prep())
+cc       <- complete(mi$imp, 0) |> prep()                  # original data with missing values
+```
+
+## Model specifications
+```{r terms}
+specs <- list(controls = ctrl,
+              ctrl_PJT = c(ctrl, blk$PJT), ctrl_IAT = c(ctrl, blk$IAT), ctrl_SAT = c(ctrl, blk$SAT),
+              full     = c(ctrl, unlist(blk)),
+              full_noPJT = c(ctrl, blk$IAT, blk$SAT), full_noIAT = c(ctrl, blk$PJT, blk$SAT),
+              full_noSAT = c(ctrl, blk$PJT, blk$IAT),
+              full_MORxSC = c(ctrl, unlist(blk), "MOR:SC"))
+outcomes <- c("off_vers", "serious_any")
+```
+
+## Fit every model in every imputed dataset (several minutes)
+```{r fit}
+fits    <- map(set_names(outcomes), \(y) map(specs, \(s) map(imp_list, \(d) fitm(d, y, s))))
+fits_cc <- map(set_names(outcomes), \(y) map(specs, \(s) fitm(cc, y, s)))
+```
+
+## RQ1 results
+```{r results}
+coef_tab <- map_dfr(outcomes, \(y) map_dfr(c("ctrl_PJT","ctrl_IAT","ctrl_SAT","full","full_MORxSC"),
+  \(s) rubin(fits[[y]][[s]]) |> mutate(outcome = y, model = s, .before = 1)))
+
+coef_cc <- map_dfr(outcomes, \(y) map_dfr(c("full","full_MORxSC"), \(s) {
+  t <- summary(fits_cc[[y]][[s]])$coefficients$cond
+  tibble(outcome = y, model = paste0(s, "_cc"), term = rownames(t), b = t[, 1], se = t[, 2],
+         ratio = exp(t[, 1]), lo = exp(t[, 1] - 1.96 * t[, 2]), hi = exp(t[, 1] + 1.96 * t[, 2]),
+         p = t[, 4], fmi = NA_real_, n = nobs(fits_cc[[y]][[s]])) }))
+
+block_tab <- map_dfr(outcomes, \(y) bind_rows(
+  lr_pool(fits[[y]]$ctrl_PJT, fits[[y]]$controls)   |> mutate(block = "PJT", type = "total"),
+  lr_pool(fits[[y]]$ctrl_IAT, fits[[y]]$controls)   |> mutate(block = "IAT", type = "total"),
+  lr_pool(fits[[y]]$ctrl_SAT, fits[[y]]$controls)   |> mutate(block = "SAT", type = "total"),
+  lr_pool(fits[[y]]$full, fits[[y]]$full_noPJT)     |> mutate(block = "PJT", type = "unique"),
+  lr_pool(fits[[y]]$full, fits[[y]]$full_noIAT)     |> mutate(block = "IAT", type = "unique"),
+  lr_pool(fits[[y]]$full, fits[[y]]$full_noSAT)     |> mutate(block = "SAT", type = "unique"),
+  lr_pool(fits[[y]]$full_MORxSC, fits[[y]]$full)    |> mutate(block = "MOR x SC", type = "H5")) |>
+  mutate(outcome = y, .before = 1))
+
+n_tab <- map_dfr(outcomes, \(y) tibble(outcome = y,
+  n_mi = nobs(fits[[y]]$full[[1]]), n_cc = nobs(fits_cc[[y]]$full)))
+
+write_csv(mutate(bind_rows(coef_tab, coef_cc), across(where(is.numeric), \(x) round(x, 3))),
+          here("output", "tables", "rq1_coef_v2.csv"))
+write_csv(mutate(block_tab, across(where(is.numeric), \(x) round(x, 3))),
+          here("output", "tables", "rq1_blocks_v2.csv"))
+write_csv(n_tab, here("output", "tables", "rq1_n_v2.csv"))
+block_tab; n_tab
+```
+
+## Save fitted models for later notebooks
+```{r save}
+write_rds(list(fits = fits, fits_cc = fits_cc), here("data", "processed", "rq1_fits.rds"))
+```

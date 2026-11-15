@@ -1,0 +1,64 @@
+---
+title: "08 · Overlap of the PJT and IAT associations with the SAT block — KHB decomposition (analysis plan v2, 8.8)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(here); library(tidyverse); library(mice)
+source(here("notebooks", "build_vars.R")); source(here("notebooks", "model_helpers.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+```{r data}
+mi       <- read_rds(here("data", "processed", "isrd3_g9_mice.rds"))
+imp_list <- complete(mi$imp, "all") |> map(\(d) d |> left_join(mi$miss_flags, by = "caseid") |> prep())
+combos   <- expand_grid(outcome = c("off_vers", "serious_any"), block = c("PJT", "IAT"))
+```
+
+## Point estimates, KHB in each imputed dataset, averaged
+```{r point}
+khb_all <- pmap_dfr(combos, \(outcome, block)
+  imap_dfr(imp_list, \(d, i) khb_one(d, outcome, block) |> mutate(imp = i)) |>
+    mutate(outcome = outcome, block = block))
+
+khb_point <- khb_all |>
+  group_by(outcome, block, term) |>
+  summarise(across(c(b_total, b_direct, diff, starts_with("via_")), mean), .groups = "drop") |>
+  mutate(pct_overlap = 100 * diff / b_total)
+khb_point
+```
+
+## Class-level bootstrap (one random imputation per replicate)
+```{r boot}
+B   <- 1000
+set.seed(123)
+cls <- unique(imp_list[[1]]$classid)
+
+boot_one <- function(r) {
+  d0   <- imp_list[[sample.int(length(imp_list), 1)]]
+  draw <- sample(cls, length(cls), replace = TRUE)
+  d    <- map2_dfr(draw, seq_along(draw), \(c, k) d0[d0$classid == c, ] |> mutate(classid = paste(c, k)))
+  tryCatch(pmap_dfr(combos, \(outcome, block)
+             khb_one(d, outcome, block) |> mutate(outcome = outcome, block = block)) |>
+             mutate(rep = r),
+           error = \(e) NULL)
+}
+boot <- map_dfr(seq_len(B), boot_one)
+
+khb_ci <- boot |>
+  mutate(pct_overlap = 100 * diff / b_total) |>
+  group_by(outcome, block, term) |>
+  summarise(n_boot = n(),
+            diff_lo = quantile(diff, .025), diff_hi = quantile(diff, .975),
+            pct_lo  = quantile(pct_overlap, .025), pct_hi = quantile(pct_overlap, .975),
+            .groups = "drop")
+```
+
+## Output
+```{r export}
+khb_out <- left_join(khb_point, khb_ci, by = c("outcome", "block", "term")) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+write_csv(khb_out, here("output", "tables", "khb_v2.csv"))
+khb_out
+```

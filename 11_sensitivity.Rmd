@@ -1,0 +1,165 @@
+---
+title: "11 · Sensitivity analyses (analysis plan v2, section 9)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages(c("survey", "EValue"))
+library(here); library(tidyverse); library(mice); library(survey); library(EValue)
+source(here("notebooks", "build_vars.R")); source(here("notebooks", "model_helpers.R"))
+options(survey.lonely.psu = "adjust")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+```{r data}
+mi <- read_rds(here("data", "processed", "isrd3_g9_mice.rds"))
+an <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+
+# variables not in the imputation: alternative outcomes, design, NTS components (left missing = complete-case within imputations)
+extra <- an |> transmute(
+  caseid, off_vers_upper, serious_upper, serious_freq, over_age,
+  nondisc0 = num(nondiscloser), p_weight = num(p_weight),
+  stratum  = interaction(cityid, schtypeid, drop = TRUE),
+  NORM_inst = rowMeans(cbind(pomp(rowMeans(cbind(num(profsnmo), num(profsnfa))), 1, 5),
+                             pomp(profsnte, 1, 5))),                                   # norms of parents and teacher
+  BOND_inst = rowMeans(cbind(pomp(FAMB, 1, 5),
+                             pomp(scale_mean(an, c("teabond1", "teabond2")), 1, 6))))  # bonds to parents and teacher
+
+zs <- \(x) as.numeric(scale(x))
+imp_list <- complete(mi$imp, "all") |>
+  map(\(d) d |> left_join(mi$miss_flags, by = "caseid") |> left_join(extra, by = "caseid") |> prep() |>
+        group_by(classid) |>
+        mutate(NTS3_cls = mean(NTS_prof, na.rm = TRUE), NTS3_wth = NTS_prof - NTS3_cls) |>   # three-informant NTS
+        ungroup() |>
+        mutate(across(c(NORM_inst, BOND_inst, LEG_nolaw, NTS3_cls, NTS3_wth, SN_prof_cm, SN_prof_pe,
+                        SHAME_arrest, SC_imp, SC_risk, SC_self), zs)))
+
+fam$off_vers_upper <- nbinom2(); fam$serious_upper <- binomial(); fam$serious_freq <- binomial()
+base_terms <- c(ctrl, unlist(blk))
+focal <- c(unlist(blk), "LEG_nolaw", "NTS3_wth", "NTS3_cls", "SN_prof_cm", "SN_prof_pe", "SHAME_arrest",
+           "SC_imp", "SC_risk", "SC_self", "NORM_inst", "BOND_inst", "NORM_inst:BOND_inst", "over_age")
+
+run <- function(dl, y, terms, label)
+  rubin(map(dl, \(d) fitm(d, y, terms))) |> filter(term %in% focal) |>
+  mutate(check = label, outcome = y, .before = 1)
+swap <- \(terms, out, inn) c(setdiff(terms, out), inn)
+```
+
+## Model-based checks (imputed data; versatility and serious offending)
+```{r checks}
+outs <- c("off_vers", "serious_any")
+no_nd <- map(imp_list, \(d) filter(d, nondisc0 %in% 0))
+
+sens <- bind_rows(
+  map_dfr(outs, \(y) run(imp_list, y, base_terms, "00 main model")),
+  run(imp_list, "off_vers_upper", base_terms, "01 blank offence items = committed"),
+  run(imp_list, "serious_upper",  base_terms, "01 blank offence items = committed"),
+  map_dfr(outs, \(y) run(no_nd, y, base_terms, "02 non-disclosers excluded")),
+  map_dfr(outs, \(y) run(imp_list, y, setdiff(base_terms, "PEERD"), "04 without delinquent peers")),
+  run(imp_list, "serious_freq", base_terms, "06 serious = any serious offence 3+ times"),
+  map_dfr(outs, \(y) run(imp_list, y, swap(base_terms, "LEG", "LEG_nolaw"), "08 legitimacy without lawfulness")),
+  map_dfr(outs, \(y) run(imp_list, y, c(base_terms, "over_age"), "09 over-age for grade added")),
+  map_dfr(c(outs, "prop_any"), \(y) run(imp_list, y, swap(base_terms, c("NTS_wth", "NTS_cls"), c("NTS3_wth", "NTS3_cls")),
+                                         "12 three-informant NTS")),
+  map_dfr(outs, \(y) run(imp_list, y, c(base_terms, "SN_prof_cm", "SN_prof_pe"), "13 peers' norms added")),
+  map_dfr(outs, \(y) run(imp_list, y, c(base_terms, "SHAME_arrest"), "14 shame about arrest added")),
+  map_dfr(outs, \(y) run(imp_list, y, swap(base_terms, "SC", c("SC_imp", "SC_risk", "SC_self")), "15 self-control subscales")))
+```
+
+## Survey-weighted single-level models (12 strata, classes as PSUs, population weights)
+```{r survey}
+svy_fit <- function(d, y) {
+  d   <- drop_imputed_y(d, y)
+  des <- svydesign(ids = ~classid, strata = ~stratum, weights = ~p_weight, data = d, nest = TRUE)
+  svyglm(reformulate(base_terms, y), design = des,
+         family = if (y == "off_vers") quasipoisson() else quasibinomial())
+}
+sens_svy <- map_dfr(outs, \(y) { fl <- map(imp_list, \(d) svy_fit(d, y))
+  rubin_cv(map(fl, coef), map(fl, vcov)) |> filter(term %in% focal) |>
+    mutate(check = "05 survey-weighted single level", outcome = y, .before = 1) })
+```
+
+## NTS components: norms and bond entered separately, and KHB with components
+```{r components}
+comp_list  <- map(imp_list, \(d) filter(d, !is.na(NORM_inst), !is.na(BOND_inst)))
+comp_terms <- swap(base_terms, "NTS_wth", c("NORM_inst", "BOND_inst", "NORM_inst:BOND_inst"))
+sens_comp  <- map_dfr(outs, \(y) run(comp_list, y, comp_terms, "07 NTS components (complete on components)"))
+
+blk$IAT_comp <- c("NORM_inst", "BOND_inst")                    # used by khb_one
+khb_comp <- map_dfr(outs, \(y) map_dfr(comp_list, \(d) khb_one(d, y, "IAT_comp")) |>
+                      group_by(term) |> summarise(across(c(b_total, b_direct, diff, starts_with("via_")), mean)) |>
+                      mutate(pct_overlap = 100 * diff / b_total, outcome = y, .before = 1))
+khb_comp
+```
+
+## Screened-out cases re-included, and grades 7-9 (complete-case, no imputation)
+```{r cc-samples}
+meas_nopj <- c(paste0("profsn", c("fr","cm","mo","fa","te","pe")),
+               paste0("shopsn", c("fr","cm","mo","fa","te","pe")),
+               paste0("prosoc", 1:8), sprintf("selfc%02d", 1:9))
+meas <- c("pjduty","pjattri1","pjattri2","pjattri3","pjbribes","pjresp","pjfair","pjexpl", meas_nopj)
+ist  <- read_rds(here("data", "processed", "isrd3_istanbul.rds"))
+
+cc_screened   <- an |> prep()
+cc_unscreened <- ist |> filter(grade == 9) |> filter(rowSums(is.na(across(all_of(meas)))) < 24) |>
+  build_outcomes() |> build_measures(equal_code = 0) |> prep()
+cc_all_grades <- ist |> filter(rowSums(is.na(across(all_of(meas_nopj)))) < 16) |>   # no PJ items in grades 7-8
+  build_outcomes() |> build_measures(equal_code = 0) |> prep() |> mutate(grade = factor(num(grade)))
+
+cc_one <- function(d, y, terms, label) {
+  t <- summary(fit_glmm(d, y, terms))$coefficients$cond
+  tibble(check = label, outcome = y, term = rownames(t), b = t[, 1], se = t[, 2], ratio = exp(t[, 1]),
+         lo = exp(t[, 1] - 1.96 * t[, 2]), hi = exp(t[, 1] + 1.96 * t[, 2]), p = t[, 4], fmi = NA_real_) |>
+    filter(term %in% focal)
+}
+terms_79 <- c(ctrl, "grade", blk$IAT, blk$SAT)                  # PJT not asked in grades 7-8
+sens_cc <- bind_rows(
+  map_dfr(outs, \(y) cc_one(cc_screened,   y, base_terms, "03a complete case, screened (reference)")),
+  map_dfr(outs, \(y) cc_one(cc_unscreened, y, base_terms, "03b complete case, screened-out cases re-included")),
+  map_dfr(c(outs, "prop_any", "viol_any"), \(y) cc_one(cc_all_grades, y, terms_79,
+                                                        "10 grades 7-9, IAT and SAT only (complete case, unscreened)")))
+c(screened = nrow(cc_screened), unscreened = nrow(cc_unscreened), grades_7_9 = nrow(cc_all_grades))
+```
+
+## Class-level NTS and property offending by grade (same sample rules)
+```{r h1-grade}
+focal   <- c(focal, "NTS_cls:g9")
+terms_h <- c(ctrl, blk$IAT, blk$SAT)
+cc_g    <- mutate(cc_all_grades, g9 = as.numeric(grade == "9"))
+h1_grade <- bind_rows(
+  cc_one(filter(cc_g, g9 == 0), "prop_any", c(terms_h, "grade"), "10b grades 7-8 only"),
+  cc_one(filter(cc_g, g9 == 1), "prop_any", terms_h,             "10c grade 9 only, grades 7-9 sample rules"),
+  cc_one(cc_g, "prop_any", c(terms_79, "NTS_cls:g9"),            "10d grades 7-9, NTS_cls x grade 9")) |>
+  filter(str_detect(term, "NTS"))
+events <- cc_g |> group_by(g9) |> summarise(n = n(), property_events = sum(prop_any, na.rm = TRUE))
+write_csv(mutate(h1_grade, across(where(is.numeric), \(v) round(v, 3))),
+          here("output", "tables", "sensitivity_h1_grade_v2.csv"))
+h1_grade; events
+```
+
+## E-values for the main associations (per 1 SD)
+```{r evalues}
+ev <- function(tab, y, trm, type, rare = FALSE) {
+  r <- filter(tab, outcome == y, term == trm)
+  e <- if (type == "RR") evalues.RR(r$ratio, r$lo, r$hi) else evalues.OR(r$ratio, r$lo, r$hi, rare = rare)
+  tibble(outcome = y, term = trm, ratio = r$ratio, E_point = e["E-values", "point"],
+         E_ci = ifelse(is.na(e["E-values", "lower"]), e["E-values", "upper"], e["E-values", "lower"]))
+}
+main <- filter(sens, check == "00 main model")
+prop <- run(imp_list, "prop_any", base_terms, "property")
+evals <- bind_rows(
+  ev(main, "off_vers", "SC", "RR"), ev(main, "off_vers", "SHAME_hurt", "RR"), ev(main, "off_vers", "MOR", "RR"),
+  ev(main, "serious_any", "SC", "OR"), ev(main, "serious_any", "SHAME_hurt", "OR"),
+  ev(prop, "prop_any", "NTS_cls", "OR", rare = TRUE), ev(prop, "prop_any", "SHAME_shop", "OR", rare = TRUE))
+evals
+```
+
+## Output
+```{r export}
+r3 <- \(x) mutate(x, across(where(is.numeric), \(v) round(v, 3)))
+write_csv(r3(bind_rows(sens, sens_svy, sens_comp, sens_cc) |> arrange(outcome, check)),
+          here("output", "tables", "sensitivity_v2.csv"))
+write_csv(r3(khb_comp), here("output", "tables", "sensitivity_khb_components_v2.csv"))
+write_csv(r3(evals),    here("output", "tables", "sensitivity_evalues_v2.csv"))
+```

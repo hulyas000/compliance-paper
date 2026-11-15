@@ -1,0 +1,140 @@
+---
+title: "01 · Data preparation — ISRD3 Istanbul, start_date = 22.06.2026"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages(c("here","haven","tidyverse","labelled"))
+
+library(here)
+library(haven)
+library(tidyverse)
+library(labelled)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the pooled ISRD3 file
+```{r load}
+# read_sav keeps spss value labels.
+isrd <- read_sav(here("data", "raw", "ISRD3-SQ.sav"))
+
+dim(isrd) # all 35 countries live here, we only need Turkiye data
+```
+
+```{r find_country}
+look_for(isrd, 'country', 'sample', 'nation') # find variable name containing country names
+# the variable name is 'country'
+# Find Turkiye's code, then confirm before filtering
+isrd |> count(country) |> print(n = Inf) # its 900
+```
+
+```{r subset}
+ist <- isrd |> filter(country == 900)
+# Istanbul should have 2,336 participant, look data|_manual
+nrow(ist)
+```
+
+## Locate grate, and confirm desing constraint
+```{r grade}
+look_for(ist, 'grade', 'class')
+
+# Module 10 was grade-9 only. So those items should be missing for grades 7-8 by design. Verify it here.
+# every procedural-justice column (in module 10) starts with 'pj'
+ist |> select(starts_with("pj")) |> names()
+ist |>
+  group_by(grade) |>
+  summarise(across(starts_with("pj"), \(x) mean(!is.na(x))))
+```
+
+## Are missings NA?
+```{r}
+# If codes are already NA, maxes are 10 / 4 / 4. If still live, you'd see 99 / 9 / 9.
+ist |> summarise(
+  pjduty_max  = max(pjduty,  na.rm = TRUE),
+  prosoc1_max = max(prosoc1, na.rm = TRUE),
+  selfc01_max = max(selfc01, na.rm = TRUE)
+)
+
+ist |> count(pjduty)    # expect 0-10 only; a stray 97/98/99 means still live
+```
+
+## Save the working subset
+```{r save}
+#dir.create(here("data", "processed"), showWarnings = FALSE)
+write_rds(ist, here("data", "processed", "isrd3_istanbul.rds"))
+```
+
+## Items for the revised paper (analysis plan v2)
+```{r revised_paper_vars}
+# uses ist from memory, so this chunk always checks the current data
+g9 <- ist |> filter(grade == 9)
+
+# items needed for the new plan, located by question number in the label
+qs <- c("\\[3\\.2", "\\[3\\.3", "\\[5\\.8", "\\[5\\.9",
+        "\\[6\\.2", "\\[6\\.3", "\\[6\\.4", "\\[9\\.2", "\\[9\\.4")
+found <- look_for(ist, qs, values = FALSE) |> as_tibble()
+
+# design variables and dataset scores named in the Data Manual
+meta <- c("classid", "schoolid", "cityid", "p_weight", "a_weight", "srvdate",
+          "grade_st", "selfc", "lselfcim", "lselfcrt", "lselfcsc")
+
+vars <- unique(c(found$variable, intersect(meta, names(ist))))
+lab  <- function(v) { l <- var_label(ist[[v]]); if (is.null(l)) "" else l }
+
+item_check <- tibble(
+  variable       = vars,
+  label          = map_chr(vars, lab),
+  pct_missing_g9 = map_dbl(vars, \(v) round(mean(is.na(g9[[v]])) * 100, 1)),
+  n_values_g9    = map_int(vars, \(v) n_distinct(g9[[v]], na.rm = TRUE)))
+
+# srvdate is already stored as a Date
+item_check <- add_row(item_check, variable = "fieldwork",
+  label = paste(unique(format(g9$srvdate, "%Y-%m")), collapse = ", "))
+
+# classes and schools in grade 9
+item_check <- add_row(item_check, variable = "design",
+  label = sprintf("classes = %d, schools = %d",
+                  n_distinct(g9$classid), n_distinct(g9$schoolid)))
+
+write_csv(item_check, here("output", "tables", "item_check.csv"))
+print(item_check, n = Inf)
+```
+
+## Design and coding checks (follow-up to item_check)
+```{r design_check}
+# 1) what are the four cityid values, and how many grade-9 cases in each?
+city <- g9 |> count(cityid) |>
+  mutate(what = "cityid", value = as.character(as_factor(cityid))) |>
+  select(what, value, n)
+
+# 2) does p_weight vary by city, class, or something else?
+wt <- g9 |> group_by(cityid) |>
+  summarise(n_weights = n_distinct(p_weight), w_min = min(p_weight), w_max = max(p_weight)) |>
+  mutate(what = "p_weight by cityid",
+         value = sprintf("%s: %d values, %.2f-%.2f", as_factor(cityid), n_weights, w_min, w_max)) |>
+  transmute(what, value, n = NA_integer_)
+
+# 3) class sizes in grade 9
+cls <- g9 |> count(classid) |>
+  summarise(value = sprintf("min %d, median %d, max %d", min(n), median(n), max(n))) |>
+  mutate(what = "grade-9 class size", n = NA_integer_)
+
+# 4) value labels of the bonding items (6 distinct values -> check coding)
+vlab <- map_dfr(c("teabond1", "teabond2", "frdbond1", "frdbond2", "shamfrd1", "profint"),
+  \(v) { vl <- val_labels(ist[[v]])
+         tibble(what = paste("labels", v),
+                value = paste(paste0(vl, "=", names(vl)), collapse = "; "),
+                n = NA_integer_) })
+
+# 5) is missing friend bond explained by having no group of friends (q5.7)?
+grp <- look_for(ist, "\\[5\\.7", values = FALSE) |> as_tibble() |> pull(variable)
+frd <- g9 |> mutate(frd_missing = is.na(frdbond1),
+                    group = as.character(as_factor(.data[[grp[1]]]))) |>
+  count(group, frd_missing) |>
+  transmute(what = paste("frdbond1 missing by", grp[1]),
+            value = paste(group, "| missing =", frd_missing), n)
+
+design_check <- bind_rows(city, wt, cls, vlab, frd)
+write_csv(design_check, here("output", "tables", "design_check.csv"))
+print(design_check, n = Inf)
+```

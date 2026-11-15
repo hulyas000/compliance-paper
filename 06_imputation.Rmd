@@ -1,0 +1,66 @@
+---
+title: "06 · Multiple imputation (analysis plan v2, section 8.7)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages("mice")
+library(here); library(tidyverse); library(mice)
+source(here("notebooks", "build_vars.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Variables for imputation
+```{r select}
+g9 <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+
+outcomes  <- c("off_vers", "serious_any", "prop_any", "viol_any", "download_any")
+predictors<- c("LEG", "LEG_nolaw", "PJ", "PJ_EQUAL", "EFF",
+               "NTS_prof_inst", "NTS_prof", "NTS_shop_inst", "SN_prof_cm", "SN_prof_pe",
+               "MOR", "SHAME_shop", "SHAME_hurt", "SHAME_arrest", "SC", "SC_imp", "SC_risk", "SC_self",
+               "male", "deprfam", "SCHB", "PEERD", "FAMB")
+binary    <- c("serious_any", "prop_any", "viol_any", "download_any", "PJ_EQUAL", "male")
+
+dat <- g9 |>
+  group_by(classid) |>                                   # observed class means as auxiliaries
+  mutate(aux_cls_nts = mean(NTS_prof_inst, na.rm = TRUE),
+         aux_cls_off = mean(off_vers, na.rm = TRUE)) |>
+  ungroup() |>
+  transmute(caseid, classid, region, schtype, nondiscloser = num(nondiscloser),
+            aux_cls_nts, aux_cls_off,
+            across(all_of(c(outcomes, predictors)), num)) |>
+  mutate(across(all_of(binary), \(x) factor(x, levels = c(0, 1))))
+
+# flags for multiple imputation then deletion (outcomes)
+miss_flags <- dat |> transmute(caseid, across(all_of(outcomes), is.na, .names = "miss_{.col}"))
+colSums(is.na(dat))
+```
+
+## Imputation model
+```{r setup-mice}
+ini  <- mice(dat, maxit = 0, printFlag = FALSE)
+meth <- ini$method
+meth[binary] <- ifelse(colSums(is.na(dat[binary])) > 0, "logreg", "")
+pred <- ini$predictorMatrix
+pred[, c("caseid", "classid")] <- 0           # identifiers are not predictors
+meth[c("caseid", "classid")] <- ""
+meth; rowSums(pred)[meth != ""]
+```
+
+## Run (20 imputations; takes a few minutes)
+```{r run}
+imp <- mice(dat, m = 50, maxit = 20, method = meth, predictorMatrix = pred,
+            seed = 123, printFlag = FALSE)
+imp$loggedEvents                              # should be NULL or minor
+plot(imp, c("NTS_prof_inst", "LEG", "FAMB", "off_vers"))   # chains should mix, no trend
+```
+
+## Save
+```{r save}
+write_rds(list(imp = imp, miss_flags = miss_flags), here("data", "processed", "isrd3_g9_mice.rds"))
+
+imp_summary <- tibble(variable = names(dat), n_missing = colSums(is.na(dat)),
+                      method = unname(meth[names(dat)])) |> filter(n_missing > 0)
+write_csv(imp_summary, here("output", "tables", "imputation_summary_v2.csv"))
+imp_summary
+```

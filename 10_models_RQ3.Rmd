@@ -1,0 +1,83 @@
+---
+title: "10 · RQ3 models — antecedents of legitimacy (H3) and indirect associations (analysis plan v2, 8.5)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(here); library(tidyverse); library(mice)
+source(here("notebooks", "build_vars.R")); source(here("notebooks", "model_helpers.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+```{r data}
+mi       <- read_rds(here("data", "processed", "isrd3_g9_mice.rds"))
+miss_leg <- complete(mi$imp, 0) |> transmute(caseid, miss_LEG = is.na(LEG))   # legitimacy is the outcome here
+imp_list <- complete(mi$imp, "all") |>
+  map(\(d) d |> left_join(mi$miss_flags, by = "caseid") |> left_join(miss_leg, by = "caseid") |> prep())
+
+antec   <- c("PJ", "EFF", "PJ_EQUAL")
+a_terms <- c(ctrl, antec)
+fit_leg <- function(d) glmmTMB(reformulate(c(a_terms, "(1 | classid)"), "LEG"),
+                               data = filter(d, !miss_LEG %in% TRUE), family = gaussian())
+
+# pooled weighted combination of coefficients, e.g. PJ - EFF
+comb_pool <- function(fl, w) {
+  est <- sapply(fl, \(f) sum(w * fixef(f)$cond[names(w)]))
+  var <- sapply(fl, \(f) { V <- vcov(f)$cond[names(w), names(w)]; as.numeric(t(w) %*% V %*% w) })
+  m <- length(fl); tv <- mean(var) + (1 + 1/m) * var(est); se <- sqrt(tv)
+  tibble(est = mean(est), se = se, lo = mean(est) - 1.96 * se, hi = mean(est) + 1.96 * se,
+         p = 2 * pnorm(-abs(mean(est) / se)))
+}
+```
+
+## Antecedents of legitimacy (H3)
+```{r legitimacy}
+fits_leg <- map(imp_list, fit_leg)
+leg_tab  <- rubin(fits_leg) |> select(term, b, se, p, fmi)       # linear model: b = SD change in legitimacy per SD
+h3       <- comb_pool(fits_leg, c(PJ = 1, EFF = -1))               # fairness minus effectiveness
+n_leg    <- nobs(fits_leg[[1]])
+leg_tab; h3; n_leg
+```
+
+## Indirect associations with offending through legitimacy (point estimates)
+```{r indirect}
+outcomes <- c("off_vers", "serious_any")
+b_terms  <- c(ctrl, blk$PJT)                                       # controls + PJT block
+
+ind_one <- function(d, y) {
+  a <- fixef(fit_leg(d))$cond[antec]
+  b <- fixef(fitm(d, y, b_terms))$cond
+  tibble(outcome = y, antecedent = antec, a = a, b_leg = b["LEG"],
+         indirect = a * b["LEG"], direct = b[antec])
+}
+ind_point <- map_dfr(outcomes, \(y) map_dfr(imp_list, \(d) ind_one(d, y))) |>
+  group_by(outcome, antecedent) |>
+  summarise(across(c(a, b_leg, indirect, direct), mean), .groups = "drop")
+ind_point
+```
+
+## Class-level bootstrap for the indirect associations
+```{r boot}
+B   <- 1000
+set.seed(123)
+cls <- unique(imp_list[[1]]$classid)
+boot <- map_dfr(seq_len(B), \(r) {
+  d0   <- imp_list[[sample.int(length(imp_list), 1)]]
+  draw <- sample(cls, length(cls), replace = TRUE)
+  d    <- map2_dfr(draw, seq_along(draw), \(c, k) d0[d0$classid == c, ] |> mutate(classid = paste(c, k)))
+  tryCatch(map_dfr(outcomes, \(y) ind_one(d, y)) |> mutate(rep = r), error = \(e) NULL) })
+
+ind_ci <- boot |> group_by(outcome, antecedent) |>
+  summarise(n_boot = n(), ind_lo = quantile(indirect, .025), ind_hi = quantile(indirect, .975),
+            .groups = "drop")
+```
+
+## Output
+```{r export}
+r3 <- \(x) mutate(x, across(where(is.numeric), \(v) round(v, 3)))
+write_csv(r3(leg_tab |> mutate(n = n_leg)), here("output", "tables", "rq3_legitimacy_v2.csv"))
+write_csv(r3(h3),                           here("output", "tables", "rq3_h3_v2.csv"))
+write_csv(r3(left_join(ind_point, ind_ci, by = c("outcome", "antecedent"))),
+          here("output", "tables", "rq3_indirect_v2.csv"))
+```

@@ -1,0 +1,121 @@
+---
+title: "04 · Measurement — CFA and discriminant validity (analysis plan v2, section 7)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+#install.packages(c("lavaan","semTools"))
+library(here); library(tidyverse); library(lavaan); library(semTools)
+source(here("notebooks", "build_vars.R"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load}
+g9 <- read_rds(here("data", "processed", "isrd3_g9_analysis.rds"))
+
+leg_items  <- c("pjduty","pjattri1","pjattri2","pjattri3","pjbribes_r")
+pj_items   <- c("pjresp","pjfair","pjexpl")
+mor_items  <- paste0("prosoc", 1:8)
+sc_items   <- sprintf("selfc%02d", 1:9)
+sh_shop    <- c("shamfrd1","shamtea1","shampar1")
+sh_hurt    <- c("shamfrd2","shamtea2","shampar2")
+sh_arrest  <- c("shamfrd3","shamtea3","shampar3")
+nt_prof    <- paste0("profsn", c("fr","cm","mo","fa","te","pe"))
+nt_shop    <- paste0("shopsn", c("fr","cm","mo","fa","te","pe"))
+
+# 0-10 items stay continuous; short Likert items are ordinal
+ord <- c("pjattri1","pjattri2","pjattri3", pj_items, mor_items, sc_items,
+         sh_shop, sh_hurt, sh_arrest, nt_prof, nt_shop)
+all_items <- c(leg_items, ord)
+g9 <- g9 |> mutate(across(all_of(all_items), num))
+
+cfit <- function(model) cfa(model, data = g9, ordered = intersect(ord, lavNames(lavParTable(model), "ov")),
+                            estimator = "WLSMV", missing = "pairwise")
+gof  <- function(fit) round(fitMeasures(fit, c("chisq.scaled","df","cfi.scaled","rmsea.scaled","srmr")), 3)
+f1   <- function(name, items) paste0("f_", name, " =~ ", paste(items, collapse = " + "))
+```
+
+## 1. Single constructs
+```{r single}
+models <- list(
+  LEG_5        = f1("LEG", leg_items),
+  LEG_nolaw    = f1("LEG", leg_items[1:4]),
+  PJ           = f1("PJ", pj_items),                     # 3 items: just-identified, fit is trivial
+  MOR          = f1("MOR", mor_items),
+  SC_1factor   = f1("SC", sc_items),
+  SC_3factor   = paste(f1("IMP", sc_items[1:3]), f1("RISK", sc_items[4:6]), f1("SELF", sc_items[7:9]), sep = "\n"),
+  SHAME_3factor= paste(f1("SHOP", sh_shop), f1("HURT", sh_hurt), f1("ARREST", sh_arrest), sep = "\n"),
+  SHAME_1factor= f1("SHAME", c(sh_shop, sh_hurt, sh_arrest)),
+  NT_2factor   = paste(f1("PROF", nt_prof), f1("SHOP", nt_shop), sep = "\n"),
+  NT_1factor   = f1("NT", c(nt_prof, nt_shop)))
+
+fits <- map(models, \(m) tryCatch(cfit(m), error = \(e) NULL))
+fit_table <- imap_dfr(fits, \(f, nm) if (is.null(f)) tibble(model = nm, note = "did not converge")
+                      else as_tibble_row(gof(f)) |> mutate(model = nm, .before = 1))
+fit_table
+```
+
+## 2. Factor correlations where the structure matters
+```{r factor-cor}
+lv_cor <- function(nm) { f <- fits[[nm]]; if (is.null(f)) return(NULL)
+  m <- lavInspect(f, "cor.lv"); idx <- which(upper.tri(m), arr.ind = TRUE)
+  tibble(model = nm, f1 = rownames(m)[idx[,1]], f2 = colnames(m)[idx[,2]], r = round(m[idx], 2)) }
+factor_cor <- map_dfr(c("SC_3factor","SHAME_3factor","NT_2factor"), lv_cor)
+factor_cor
+```
+
+## 3. Full measurement model and discriminant validity
+```{r full}
+m_full <- paste(f1("LEG", leg_items), f1("PJ", pj_items), f1("MOR", mor_items), f1("SC", sc_items),
+                f1("SHOP", sh_shop), f1("HURT", sh_hurt), f1("PROF", nt_prof), sep = "\n")
+f_full <- cfit(m_full)
+full_fit <- as_tibble_row(gof(f_full)) |> mutate(model = "full", .before = 1)
+full_cor <- lavInspect(f_full, "cor.lv")
+htmt_tab <- htmt(m_full, sample.cov = lavInspect(f_full, "sampstat")$cov)
+round(full_cor, 2); round(htmt_tab, 2)      # HTMT < .85 supports discriminant validity
+```
+
+## 4. Output
+```{r export}
+idx <- which(upper.tri(full_cor), arr.ind = TRUE)
+full_pairs <- tibble(model = "full", f1 = rownames(full_cor)[idx[,1]], f2 = colnames(full_cor)[idx[,2]],
+                     r = round(full_cor[idx], 2), htmt = round(as.matrix(htmt_tab)[cbind(colnames(full_cor)[idx[,2]], rownames(full_cor)[idx[,1]])], 2))
+write_csv(bind_rows(fit_table, full_fit), here("output", "tables", "cfa_fit_v2.csv"))
+write_csv(bind_rows(factor_cor, full_pairs), here("output", "tables", "cfa_cor_v2.csv"))
+```
+
+## 5. Informant residual correlations (shame and vignettes)
+```{r res}
+inf <- c("fr","cm","mo","fa","te","pe")
+m_shame_inf <- paste(models$SHAME_3factor,
+  "shamfrd1 ~~ shamfrd2 + shamfrd3", "shamfrd2 ~~ shamfrd3",
+  "shamtea1 ~~ shamtea2 + shamtea3", "shamtea2 ~~ shamtea3",
+  "shampar1 ~~ shampar2 + shampar3", "shampar2 ~~ shampar3", sep = "\n")
+m_nt_inf <- paste(models$NT_2factor,
+  paste0("profsn", inf, " ~~ shopsn", inf, collapse = "\n"),
+  "profsnmo ~~ profsnfa", "shopsnmo ~~ shopsnfa", sep = "\n")
+fits_inf <- list(SHAME_3factor_inf = cfit(m_shame_inf), NT_2factor_inf = cfit(m_nt_inf))
+fit_inf  <- imap_dfr(fits_inf, \(f, nm) as_tibble_row(as.list(unclass(gof(f)))) |> mutate(model = nm, .before = 1))
+cor_inf  <- imap_dfr(fits_inf, \(f, nm) { m <- lavInspect(f, "cor.lv"); idx <- which(upper.tri(m), arr.ind = TRUE)
+  tibble(model = nm, f1 = rownames(m)[idx[,1]], f2 = colnames(m)[idx[,2]], r = round(m[idx], 2)) })
+write_csv(bind_rows(fit_inf, cor_inf), here("output", "tables", "cfa_informant_v2.csv"))
+fit_inf; cor_inf
+```
+
+## 6. Adult vs peer informants within each vignette
+```{r four-factor model}
+m_nt4 <- paste(
+  "f_PROF_adult =~ profsnmo + profsnfa + profsnte",
+  "f_PROF_peer  =~ profsnfr + profsncm + profsnpe",
+  "f_SHOP_adult =~ shopsnmo + shopsnfa + shopsnte",
+  "f_SHOP_peer  =~ shopsnfr + shopsncm + shopsnpe",
+  paste0("profsn", inf, " ~~ shopsn", inf, collapse = "\n"), sep = "\n")
+f_nt4   <- cfit(m_nt4)
+fit_nt4 <- as_tibble_row(as.list(unclass(gof(f_nt4)))) |> mutate(model = "NT_4factor_adult_peer", .before = 1)
+m4      <- lavInspect(f_nt4, "cor.lv"); idx <- which(upper.tri(m4), arr.ind = TRUE)
+cor_nt4 <- tibble(model = "NT_4factor_adult_peer", f1 = rownames(m4)[idx[,1]],
+                  f2 = colnames(m4)[idx[,2]], r = round(m4[idx], 2))
+write_csv(bind_rows(fit_nt4, cor_nt4), here("output", "tables", "cfa_nt4_v2.csv"))
+fit_nt4; cor_nt4
+```
+

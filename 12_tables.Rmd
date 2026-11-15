@@ -1,0 +1,661 @@
+---
+title: "12 · Manuscript tables (charts to be added)"
+output: html_notebook
+---
+
+Reads the final csv files written by notebooks 03-11 and builds every manuscript table.
+Each table is shown below and all tables are written to one Word file:
+`output/tables/manuscript_tables.docx` (one table per page; wide tables in landscape).
+Nothing is re-estimated here.
+
+```{r setup, include=FALSE}
+library(here); library(tidyverse); library(flextable); library(officer)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+sfx <- "_v2"                                  # suffix of the final csv files; change if you renamed them
+rd  <- \(f) read_csv(here("output", "tables", paste0(f, sfx, ".csv")), show_col_types = FALSE)
+```
+
+## Labels and formatting helpers
+```{r helpers}
+lab <- c(
+  # outcomes
+  off_vers = "Versatility (number of offence types)", prop_any = "Property offending",
+  viol_any = "Violent offending", oth_any = "Other offending", serious_any = "Serious offending",
+  download_any = "Illegal downloading",
+  # procedural justice
+  LEG = "Legitimacy", PJ = "Procedural fairness", PJ_EQUAL = "Police treat all groups equally",
+  EFF = "Perceived police effectiveness",
+  # institutional anomie
+  NTS_wth = "Norm transmission, within class", NTS_cls = "Norm transmission, class mean",
+  NTS_prof_inst = "Norm transmission (student score)", NTS_prof_inst_cls = "Norm transmission (class mean)",
+  # situational action
+  MOR = "Morality", SHAME_shop = "Shame: shoplifting", SHAME_hurt = "Shame: hurting someone",
+  SC = "Self-control", `MOR:SC` = "Morality × self-control",
+  # controls
+  male = "Male", deprfam = "Family deprivation", SCHB = "School bond", PEERD = "Delinquent peers",
+  # sensitivity-only terms
+  SHAME_arrest = "Shame: being arrested", SC_imp = "Self-control: impulsivity (reversed)",
+  SC_risk = "Self-control: risk-taking (reversed)", SC_self = "Self-control: self-centredness (reversed)",
+  over_age = "Over age for grade 9", SN_prof_cm = "Classmates' norms", SN_prof_pe = "Neighbourhood peers' norms",
+  NORM_inst = "Norm part (parents and teacher)", BOND_inst = "Bond part (parents and teacher)",
+  `NORM_inst:BOND_inst` = "Norm × bond", MOR7 = "Morality (seven items, without downloading)",
+  z_prosoc4 = "Morality: illegal downloading item", `NTS_cls:g9` = "Norm transmission, class mean × grade 9")
+labv <- \(x) unname(coalesce(lab[x], x))
+
+fmt <- \(x, d = 2) ifelse(is.na(x), "", formatC(x, format = "f", digits = d))
+fp  <- \(p) case_when(is.na(p) ~ "", p < .001 ~ "<.001",
+                      TRUE ~ sub("^(-?)0\\.", "\\1.", formatC(p, format = "f", digits = 3)))
+ci  <- \(r, lo, hi, d = 2) ifelse(is.na(r), "", paste0(fmt(r, d), " [", fmt(lo, d), ", ", fmt(hi, d), "]"))
+pct <- \(x) fmt(x, 1)
+
+b_thick <- fp_border(color = "black", width = 1)
+b_thin  <- fp_border(color = "black", width = .75)
+
+# APA-style table: title above, rule under the title, rule under the header, rule at the end, note below
+apa <- function(ft, title, note = NULL, panel_rows = NULL, width = 6.5, left = 1) {
+  ft <- ft |>
+    font(fontname = "Times New Roman", part = "all") |> fontsize(size = 10, part = "all") |>
+    border_remove() |>
+    hline_top(part = "header", border = b_thick) |>
+    hline_bottom(part = "header", border = b_thin) |>
+    hline_bottom(part = "body", border = b_thick) |>
+    align(align = "center", part = "all") |> align(j = left, align = "left", part = "all") |>
+    valign(valign = "bottom", part = "header") |> padding(padding = 1, part = "all")
+  if (!is.null(panel_rows)) ft <- ft |> bold(i = panel_rows, part = "body") |> italic(i = panel_rows, part = "body") |>
+      merge_h_range(i = panel_rows, j1 = 1, j2 = ncol_keys(ft), part = "body") |>
+      align(i = panel_rows, align = "left", part = "body")
+  if (!is.null(note)) ft <- ft |> add_footer_lines(paste("Note.", note)) |> fontsize(size = 9, part = "footer") |>
+      font(fontname = "Times New Roman", part = "footer") |> align(align = "left", part = "footer")
+  # column widths: fit to content; if too wide, narrow the widest (text) column so its text wraps
+  ft <- autofit(ft, add_w = 0.1, part = "body")       # headers wrap
+  w  <- dim(ft)$widths
+  if (sum(w) > width) {
+    k <- which.max(w); w[k] <- max(1.5, width - sum(w[-k]))
+    if (sum(w) > width) w <- w * width / sum(w)
+    ft <- width(ft, width = w)
+  }
+  # title added last so that it does not affect the column widths
+  ft |> add_header_lines(title) |> bold(i = 1, part = "header") |> align(i = 1, align = "left", part = "header") |>
+    fontsize(i = 1, size = 10, part = "header")
+}
+
+# insert a bold panel label row before each group; returns the data and the row numbers of the labels
+with_panels <- function(df, group_col) {
+  g <- df[[group_col]]; df[[group_col]] <- NULL
+  out <- map_dfr(unique(g), \(x) bind_rows(
+    tibble(!!names(df)[1] := x) |> mutate(across(everything(), as.character)),
+    df[g == x, ] |> mutate(across(everything(), as.character))))
+  out[is.na(out)] <- ""
+  list(df = out, rows = which(out[[1]] %in% unique(g)))
+}
+
+tabs <- list()       # every table goes here: list(ft = , landscape = )
+add_tab <- function(name, ft, landscape = FALSE) tabs[[name]] <<- list(ft = ft, landscape = landscape)
+```
+
+## Read the result files
+```{r read}
+var_sum <- rd("var_summary"); prev <- rd("prevalence_by_sex"); icc <- rd("icc"); rel <- rd("reliability")
+rq1     <- rd("rq1_coef");    blocks <- rd("rq1_blocks"); n1 <- rd("rq1_n")
+khb     <- rd("khb");         khb_c  <- rd("sensitivity_khb_components")
+t_slope <- rd("rq2_type_slopes"); t_diff <- rd("rq2_type_diff"); sep <- rd("rq2_separate")
+dl      <- rd("rq2_download");    loco   <- rd("rq2_loco")
+g_int   <- rd("rq2_gender_int");  g_ame  <- rd("rq2_gender_ame")
+leg     <- rd("rq3_legitimacy");  h3     <- rd("rq3_h3"); ind <- rd("rq3_indirect")
+sens    <- rd("sensitivity");     ev     <- rd("sensitivity_evalues"); h1g <- rd("sensitivity_h1_grade")
+
+theory_of <- \(t) case_when(t %in% c("LEG","PJ","PJ_EQUAL","EFF") ~ "Procedural justice",
+                            t %in% c("NTS_wth","NTS_cls") ~ "Institutional anomie",
+                            t %in% c("MOR","SHAME_shop","SHAME_hurt","SC","MOR:SC") ~ "Situational action",
+                            t %in% c("male","deprfam","SCHB","PEERD") ~ "Controls", TRUE ~ NA_character_)
+theory_levels <- c("Procedural justice", "Institutional anomie", "Situational action", "Controls")
+term_order <- c("LEG","PJ","PJ_EQUAL","EFF","NTS_wth","NTS_cls","MOR","SHAME_shop","SHAME_hurt","SC","MOR:SC",
+                "male","deprfam","SCHB","PEERD")
+```
+
+## Appendix Table A9. Measures
+Item descriptions are short summaries; check them against the questionnaire wording.
+```{r t1}
+rel_all <- rel |> filter(group == "all")
+t1_raw <- tribble(
+  ~theory, ~var, ~description, ~rel_name,
+  "Outcomes", "off_vers", "Number of 13 offence types committed in the last year (*lyp items)", NA,
+  "Outcomes", "prop_any", "Any of: shoplifting, burglary, bicycle theft, car theft, theft from a car, theft from a person (shop, burg, bict, cart, carb, thef)", NA,
+  "Outcomes", "viol_any", "Any of: robbery, carrying a weapon, group fight, assault (exto, weap, gfig, aslt)", NA,
+  "Outcomes", "oth_any", "Any of: graffiti, vandalism, drug selling (graf, vand, drud)", NA,
+  "Outcomes", "serious_any", "Any of: burglary, car theft, robbery, assault, carrying a weapon, drug selling", NA,
+  "Outcomes", "download_any", "Illegal downloading in the last year (downlyp)", NA,
+  "Procedural justice", "LEG", "Duty to obey (pjduty), moral alignment (pjattri1-3), lawfulness: bribes reversed (pjbribes); items standardised. Full wording of all items in Table A1", "LEG",
+  "Procedural justice", "PJ", "Police treat people with respect, make fair decisions, explain decisions (pjresp, pjfair, pjexpl)", "PJ",
+  "Procedural justice", "PJ_EQUAL", "Police treat all groups equally (pjdiscr; 1 = equally)", NA,
+  "Procedural justice", "EFF", "How quickly the police would arrive at the scene (pjspeed)", NA,
+  "Institutional anomie", "NTS_prof_inst", "Expected reaction of parents and teacher to selling a phone at a high price by hiding a cheaper model (profsnmo, profsnfa, profsnte), each weighted by bond to that person (fambond1-4, teabond1-2); split into class mean and within-class deviation", "FAMB",
+  "Situational action", "MOR", "How wrong it is to do eight acts (prosoc1-8)", "MOR",
+  "Situational action", "SHAME_shop", "Shame if parents, teacher, friends found out about shoplifting (shampar1, shamtea1, shamfrd1)", "SHAME_shop",
+  "Situational action", "SHAME_hurt", "Shame if parents, teacher, friends found out about hurting someone (shampar2, shamtea2, shamfrd2)", "SHAME_hurt",
+  "Situational action", "SC", "Nine items: impulsivity, risk-taking, self-centredness (selfc01-09); POMP score", "SC",
+  "Controls", "male", "Sex (1 = male)", NA,
+  "Controls", "deprfam", "Family deprivation (deprfam)", NA,
+  "Controls", "SCHB", "School bond (schbond1-4)", "SCHB",
+  "Controls", "PEERD", "Number of five delinquent acts committed by friends (delpdr, delpsl, delpbu, delpex, delpas)", NA,
+  "Controls", "region", "District socio-economic level, four groups (cityid)", NA,
+  "Controls", "schtype", "School type: general, imam hatip, vocational (schtypeid)", NA)
+
+t1 <- t1_raw |>
+  left_join(rel_all |> select(rel_name = scale, k, alpha_std, omega), by = "rel_name") |>
+  left_join(var_sum |> select(var = variable, min, max), by = "var") |>
+  transmute(theory, Measure = labv(var), Description = description,
+            Range = ifelse(is.na(min), "", paste0(fmt(min), "–", fmt(max))),
+            k = ifelse(is.na(k), "", as.character(k)), alpha = fmt(alpha_std), omega = fmt(omega)) |>
+  mutate(Measure = recode(Measure, region = "District socio-economic level", schtype = "School type"))
+p1 <- with_panels(t1, "theory")
+ft1 <- flextable(p1$df) |>
+  set_header_labels(alpha = "α", omega = "ω") |>
+  apa("Table A9. Measures", panel_rows = p1$rows, width = 9, left = 1:2,
+      note = paste("Range is the observed range before standardisation. α = standardised Cronbach's alpha;",
+                   "ω = omega total. For norm transmission, α and ω refer to the family bond items.",
+                   "All continuous predictors are standardised (z-scores) in the models."))
+add_tab("t1", ft1, landscape = TRUE); ft1
+```
+
+## Table 1. Descriptive statistics
+```{r t2}
+icc_v  <- \(v) { x <- icc$icc[match(v, icc$variable)]; fmt(x) }
+girls  <- prev |> filter(sex == "girls"); boys <- prev |> filter(sex == "boys")
+bin_y  <- c("prop_any", "viol_any", "oth_any", "serious_any", "download_any")
+
+t2a <- bind_rows(
+  tibble(Variable = labv("off_vers"),
+         All   = paste0(fmt(var_sum$mean[var_sum$variable == "off_vers"]), " (",
+                        fmt(var_sum$sd[var_sum$variable == "off_vers"]), ")"),
+         Girls = "", Boys = "",
+         `% missing` = pct(var_sum$pct_missing[var_sum$variable == "off_vers"]), ICC = icc_v("off_vers")),
+  map_dfr(bin_y, \(y) tibble(
+    Variable = labv(y),
+    All   = pct(100 * var_sum$mean[var_sum$variable == y]),
+    Girls = paste0(pct(girls[[paste0(y, "_pct")]]), " (", girls[[paste0(y, "_n")]], ")"),
+    Boys  = paste0(pct(boys[[paste0(y, "_pct")]]),  " (", boys[[paste0(y, "_n")]],  ")"),
+    `% missing` = pct(var_sum$pct_missing[var_sum$variable == y]), ICC = icc_v(y))))
+ft2a <- flextable(t2a) |>
+  set_header_labels(All = "All", Girls = paste0("Girls (n = ", girls$n, ")"), Boys = paste0("Boys (n = ", boys$n, ")")) |>
+  apa("Table 1. Descriptive statistics. Panel A: Offending in the last year",
+      note = paste("Versatility: mean (SD). Other rows: % (number of students).",
+                   "ICC = intra-class correlation for classes (latent scale for binary outcomes)."))
+
+pred_v <- c("LEG","PJ","PJ_EQUAL","EFF","NTS_prof_inst","NTS_prof_inst_cls","MOR","SHAME_shop","SHAME_hurt","SC",
+            "male","deprfam","SCHB","PEERD")
+icc_nts <- if ("NTS_prof_inst" %in% icc$variable) "NTS_prof_inst" else "NTS_prof"
+t2b <- var_sum |> filter(variable %in% pred_v) |>
+  mutate(variable = factor(variable, levels = pred_v)) |> arrange(variable) |>
+  transmute(Variable = labv(as.character(variable)),
+            `M or %` = ifelse(variable %in% c("PJ_EQUAL", "male"), pct(100 * mean), fmt(mean)),
+            SD = ifelse(variable %in% c("PJ_EQUAL", "male"), "", fmt(sd)),
+            Range = paste0(fmt(min), "–", fmt(max)), `% missing` = pct(pct_missing),
+            ICC = case_when(variable == "NTS_prof_inst" ~ icc_v(icc_nts),
+                            variable == "NTS_prof_inst_cls" ~ "",
+                            TRUE ~ icc_v(as.character(variable))),
+            alpha = fmt(rel_all$alpha_std[match(as.character(variable), rel_all$scale)]))
+ft2b <- flextable(t2b) |>
+  set_header_labels(alpha = "α") |>
+  apa("Table 1 (continued). Panel B: Predictors and controls",
+      note = paste("Values before standardisation. Binary variables are shown as %. α = standardised Cronbach's alpha.",
+                   if (icc_nts == "NTS_prof") "ICC for norm transmission refers to the three-informant measure." else ""))
+add_tab("t2a", ft2a); add_tab("t2b", ft2b); ft2a; ft2b
+```
+
+## Table 2. Contribution of each theory (pooled likelihood-ratio tests)
+```{r t3}
+blk_lab <- c(PJT = "Procedural justice", IAT = "Institutional anomie", SAT = "Situational action",
+             `MOR x SC` = "Morality × self-control")
+t3 <- blocks |>
+  mutate(cell_D2 = fmt(D2), cell_p = fp(p), cell_aic = fmt(dAIC, 1),
+         type = ifelse(type == "H5", "unique", type)) |>
+  select(outcome, block, type, df, cell_D2, cell_p, cell_aic) |>
+  pivot_wider(names_from = type, values_from = c(cell_D2, cell_p, cell_aic)) |>
+  mutate(block = factor(block, levels = names(blk_lab))) |>
+  arrange(outcome, block) |> mutate(outcome = labv(outcome)) |>
+  transmute(outcome, Block = blk_lab[as.character(block)], df = as.character(df),
+            T_D2 = cell_D2_total, T_p = cell_p_total, T_aic = cell_aic_total,
+            U_D2 = cell_D2_unique, U_p = cell_p_unique, U_aic = cell_aic_unique)
+t3[is.na(t3)] <- ""
+p3 <- with_panels(t3, "outcome")
+ft3 <- flextable(p3$df) |>
+  set_header_labels(T_D2 = "D2", T_p = "p", T_aic = "ΔAIC", U_D2 = "D2", U_p = "p", U_aic = "ΔAIC") |>
+  add_header_row(values = c("", "", "Total contribution", "Unique contribution"), colwidths = c(1, 1, 3, 3)) |>
+  apa("Table 2. Contribution of each theory's measures to the models of offending", panel_rows = p3$rows,
+      note = paste("Total contribution: the theory's measures added to the controls only.",
+                   "Unique contribution: the theory's measures added to a model with the other two theories.",
+                   "Morality × self-control: the interaction added to the full model.",
+                   "D2 = pooled likelihood-ratio statistic over 50 imputations; ΔAIC = mean change in AIC (negative = better fit).",
+                   "Versatility: negative binomial; serious offending: logistic; random intercept for class."))
+add_tab("t3", ft3); ft3
+```
+
+## Appendix Table A10. Coefficients of the theory measures
+```{r t4}
+alone <- rq1 |> filter(model %in% c("ctrl_PJT", "ctrl_IAT", "ctrl_SAT"),
+                       (model == "ctrl_PJT" & term %in% c("LEG","PJ","PJ_EQUAL","EFF")) |
+                       (model == "ctrl_IAT" & term %in% c("NTS_wth","NTS_cls")) |
+                       (model == "ctrl_SAT" & term %in% c("MOR","SHAME_shop","SHAME_hurt","SC"))) |>
+  mutate(col = "alone")
+full  <- rq1 |> filter(model == "full", term %in% term_order) |> mutate(col = "full")
+inter <- rq1 |> filter(model == "full_MORxSC", term == "MOR:SC") |> mutate(col = "full")
+t4 <- bind_rows(alone, full, inter) |>
+  mutate(cell = ci(ratio, lo, hi), key = paste(outcome, col, sep = "_")) |>
+  select(term, key, cell) |>
+  pivot_wider(names_from = key, values_from = cell) |>
+  mutate(theory = factor(theory_of(term), levels = theory_levels), term = factor(term, levels = term_order)) |>
+  arrange(theory, term) |>
+  transmute(theory = as.character(theory), Measure = labv(as.character(term)),
+            v_alone = off_vers_alone, v_full = off_vers_full, s_alone = serious_any_alone, s_full = serious_any_full)
+t4[is.na(t4)] <- ""
+p4 <- with_panels(t4, "theory")
+nn <- \(y) n1$n_mi[n1$outcome == y]
+ft4 <- flextable(p4$df) |>
+  set_header_labels(v_alone = "Theory alone", v_full = "Full model", s_alone = "Theory alone", s_full = "Full model") |>
+  add_header_row(values = c("", "Versatility, IRR [95% CI]", "Serious offending, OR [95% CI]"),
+                 colwidths = c(1, 2, 2)) |>
+  apa("Table A10. Associations of the theory measures with offending", panel_rows = p4$rows, width = 6.5,
+      note = paste(paste0("n = ", nn("off_vers"), " (versatility) and ", nn("serious_any"), " (serious offending)."),
+                   "Theory alone: the theory's measures with the controls only. Full model: all three theories and the controls.",
+                   "Morality × self-control is from a separate model that adds the interaction to the full model.",
+                   "Continuous predictors are per SD. All models include district socio-economic level and school type",
+                   "and a random intercept for class. Estimates pooled over 50 imputations with Rubin's rules."))
+add_tab("t4", ft4); ft4
+```
+
+## Appendix Table A11. Overlap of procedural justice and institutional anomie associations with the situational action measures (KHB)
+```{r t5}
+t5 <- khb |>
+  mutate(term = factor(term, levels = term_order)) |> arrange(outcome, term) |>
+  transmute(outcome = labv(outcome), Measure = labv(as.character(term)),
+            Total = fmt(b_total, 3), Direct = fmt(b_direct, 3),
+            Difference = ci(diff, diff_lo, diff_hi, 3),
+            `% overlap` = ci(pct_overlap, pct_lo, pct_hi, 0),
+            Morality = fmt(via_MOR, 3), `Shame: shoplifting` = fmt(via_SHAME_shop, 3),
+            `Shame: hurting` = fmt(via_SHAME_hurt, 3), `Self-control` = fmt(via_SC, 3))
+p5 <- with_panels(t5, "outcome")
+ft5 <- flextable(p5$df) |>
+  set_header_labels(Difference = "Difference [95% CI]", `% overlap` = "% overlap [95% CI]") |>
+  add_header_row(values = c("", "Coefficient (log scale)", "", "Part of the difference shared with"),
+                 colwidths = c(1, 3, 1, 4)) |>
+  apa("Table A11. Overlap of the procedural justice and institutional anomie associations with the situational action measures",
+      panel_rows = p5$rows, width = 9,
+      note = paste("KHB decomposition (Karlson, Holm & Breen, 2012). Total: coefficient without the situational action",
+                   "measures, on the scale of the full model. Direct: coefficient with them. Difference = total − direct.",
+                   "Point estimates averaged over 50 imputations; 95% CIs from a class-level bootstrap (B = 1,000).",
+                   "% overlap is not interpreted where the total coefficient is close to zero."))
+add_tab("t5", ft5, landscape = TRUE); ft5
+```
+
+## Appendix Table A12. Property and violent offending (stacked model)
+```{r t6}
+type_order <- c("LEG","PJ","PJ_EQUAL","EFF","NTS_wth","NTS_cls","MOR","SHAME_shop","SHAME_hurt","SC",
+                "male","deprfam","SCHB","PEERD")
+t6 <- t_slope |>
+  mutate(cell = ci(ratio, lo, hi)) |> select(mechanism, type, cell) |>
+  pivot_wider(names_from = type, values_from = cell) |>
+  left_join(t_diff |> transmute(mechanism, diff = ci(ratio, lo, hi), p_diff = fp(p)), by = "mechanism") |>
+  mutate(theory = factor(theory_of(mechanism), levels = theory_levels),
+         mechanism = factor(mechanism, levels = type_order)) |>
+  arrange(theory, mechanism) |>
+  transmute(theory = as.character(theory), Measure = labv(as.character(mechanism)),
+            Property = property, Violent = violent, Ratio = diff, p = p_diff)
+p6 <- with_panels(t6, "theory")
+ft6 <- flextable(p6$df) |>
+  set_header_labels(Property = "Property, OR [95% CI]", Violent = "Violent, OR [95% CI]",
+                    Ratio = "Ratio of ORs [95% CI]", p = "p (difference)") |>
+  apa("Table A12. Associations with property and violent offending", panel_rows = p6$rows, width = 9,
+      note = paste("Stacked logistic model with random intercepts for student and class; every measure listed may differ",
+                   "between the two offence types. Ratio of ORs = violent OR / property OR; p tests whether the two ORs differ.",
+                   "District socio-economic level and school type are shared across types. Per SD for continuous predictors.",
+                   "Pooled over 50 imputations."))
+add_tab("t6", ft6, landscape = TRUE); ft6
+```
+
+## Appendix Table A13. Differences between girls and boys (versatility)
+```{r t7}
+joint <- g_int |> filter(term == "all mechanism x sex")
+gi <- g_int |> filter(term != "all mechanism x sex") |>
+  mutate(mechanism = str_remove(term, ":male|male:"), p_bh = p.adjust(p, method = "BH"))
+t7 <- gi |>
+  left_join(g_ame |> mutate(cell = ci(est, lo, hi)) |> select(term, sex, cell) |>
+              pivot_wider(names_from = sex, values_from = cell), by = c("mechanism" = "term")) |>
+  mutate(theory = factor(theory_of(mechanism), levels = theory_levels),
+         mechanism = factor(mechanism, levels = term_order)) |>
+  arrange(theory, mechanism) |>
+  transmute(theory = as.character(theory), Measure = labv(as.character(mechanism)),
+            Interaction = ci(ratio, lo, hi), p = fp(p), p_bh = fp(p_bh), MDD = fmt(mdd),
+            Girls = girls, Boys = boys)
+p7 <- with_panels(t7, "theory")
+ft7 <- flextable(p7$df) |>
+  set_header_labels(Interaction = "IRR [95% CI]", p_bh = "p (BH)", MDD = "MDD",
+                    Girls = "Girls", Boys = "Boys") |>
+  add_header_row(values = c("", "Measure × male", "Average marginal effect [95% CI]"), colwidths = c(1, 4, 2)) |>
+  apa("Table A13. Differences between girls and boys in the associations with versatility", panel_rows = p7$rows, width = 9,
+      note = paste0("Negative binomial model of versatility with all measure × male interactions added to the full model. ",
+                    "Joint test of the interactions: D2 = ", fmt(joint$D2), ", df = ", joint$df, ", p = ", fp(joint$p),
+                    ", ΔAIC = ", fmt(joint$dAIC, 1), ". p (BH) = p adjusted for nine tests (Benjamini-Hochberg). ",
+                    "MDD = smallest difference (log scale) detectable with 80% power at α = .05. ",
+                    "Average marginal effect = change in the expected number of offence types per SD (per category for binary measures), ",
+                    "random effects set to zero. Pooled over 50 imputations."))
+add_tab("t7", ft7, landscape = TRUE); ft7
+```
+
+## Table 3 and Appendix Table A14. Correlates of legitimacy and indirect associations
+```{r t8}
+leg_order <- c("PJ", "EFF", "PJ_EQUAL", "male", "deprfam", "SCHB", "PEERD")
+t8a <- bind_rows(
+  leg |> filter(term %in% leg_order) |> mutate(term = factor(term, levels = leg_order)) |> arrange(term) |>
+    transmute(Measure = labv(as.character(term)), b = fmt(b), SE = fmt(se), p = fp(p)),
+  tibble(Measure = "Procedural fairness − perceived effectiveness",
+         b = paste0(fmt(h3$est), " [", fmt(h3$lo), ", ", fmt(h3$hi), "]"), SE = fmt(h3$se), p = fp(h3$p)))
+ft8a <- flextable(t8a) |>
+  set_header_labels(b = "b") |>
+  apa(paste0("Table 3. Correlates of legitimacy (n = ", leg$n[1], ")"),
+      note = paste("Linear multilevel model; legitimacy and continuous predictors in SD units; equal treatment and male are binary.",
+                   "The model includes district socio-economic level, school type and a random intercept for class.",
+                   "The last row tests whether the fairness and effectiveness coefficients differ (95% CI in brackets)."))
+
+t8b <- ind |>
+  mutate(antecedent = factor(antecedent, levels = c("PJ", "EFF", "PJ_EQUAL"))) |> arrange(outcome, antecedent) |>
+  transmute(outcome = labv(outcome), Measure = labv(as.character(antecedent)),
+            a = fmt(a), b = fmt(b_leg, 3), Indirect = ci(indirect, ind_lo, ind_hi, 3), Direct = fmt(direct, 3))
+p8 <- with_panels(t8b, "outcome")
+ft8b <- flextable(p8$df) |>
+  set_header_labels(a = "a", b = "b",
+                    Indirect = "Indirect a × b [95% CI]", Direct = "Direct") |>
+  apa("Table A14. Indirect associations with offending through legitimacy", panel_rows = p8$rows,
+      note = paste("a = measure → legitimacy (SD units); b = legitimacy → offending.",
+                   "b and the direct associations are on the log scale and come from models with the controls and the",
+                   "procedural justice measures, without the situational action measures; the indirect associations are",
+                   "therefore upper limits (see Table A11). 95% CIs from a class-level bootstrap (B = 1,000)."))
+add_tab("t8a", ft8a); add_tab("t8b", ft8b); ft8a; ft8b
+```
+
+## Appendix Table A1. Questionnaire items and response scales
+Wording is from the ISRD-3 master questionnaire (English); question numbers follow it.
+Students answered the Turkish version.
+```{r a_items}
+ofs <- ""                                       # response and coding given once, in the panel label
+ofc <- function(type) paste0("Offence type: ", type)
+items <- tribble(
+  ~group, ~Measure, ~Q, ~Wording, ~Response, ~Coding,
+  # ---- offending (Q7.1: "Have you ever in your life ...")
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Graffiti", "7.1", "... painted on a wall, train, subway or bus (graffiti)?", ofs, ofc("Other"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Vandalism", "7.1", "... damaged something on purpose, such as a bus shelter, a window, a car or a seat in the bus or train?", ofs, ofc("Other"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Shoplifting", "7.1", "... stolen something from a shop or department store?", ofs, ofc("Property"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Burglary", "7.1", "... broken into a building to steal something?", ofs, ofc("Property; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Bicycle theft", "7.1", "... stolen a bicycle?", ofs, ofc("Property"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Car theft", "7.1", "... stolen a motorbike or car?", ofs, ofc("Property; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Theft from a car", "7.1", "... stolen something off or from a car?", ofs, ofc("Property"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Robbery", "7.1", "... used a weapon, force or threat of force to get money or things from someone?", ofs, ofc("Violent; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Theft from a person", "7.1", "... stolen something from a person without force or threat?", ofs, ofc("Property"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Carrying a weapon", "7.1", "... carried a weapon, such as a stick, knife, gun, or chain?", ofs, ofc("Violent; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Group fight", "7.1", "... taken part in a group fight in a football stadium, on the street or other public place?", ofs, ofc("Violent"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Assault", "7.1", "... beaten someone up or hurt someone with a stick or knife so badly that the person was injured?", ofs, ofc("Violent; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Drug selling", "7.1", "... sold any drugs or helped someone selling drugs?", ofs, ofc("Other; serious"),
+  "Offending (Q7.1). Have you ever in your life ... no / yes; if yes, how often in the last 12 months? Coded 1 = at least once in the last 12 months", "Illegal downloading", "7.1", "... illegally downloaded music or films from the internet?", ofs, "Analysed separately",
+  # ---- procedural justice (Module 10, grade 9 only)
+  "Procedural justice (Module 10, grade 9 only)", "Procedural fairness", "10.3", "Would you say the police generally treat young people with respect?", "(almost) never / sometimes / often / (almost) always", "1-4; mean of the three items",
+  "Procedural justice (Module 10, grade 9 only)", "Procedural fairness", "10.4", "How often, would you say, the police make fair decisions when dealing with young people?", "(almost) never / sometimes / often / (almost) always", "1-4; mean of the three items",
+  "Procedural justice (Module 10, grade 9 only)", "Procedural fairness", "10.5", "How often would you say the police explain their decisions and actions to young people?", "(almost) never / sometimes / often / (almost) always", "1-4; mean of the three items",
+  "Procedural justice (Module 10, grade 9 only)", "Police treat all groups equally", "10.1", "When victims report crimes to the police, do you think the police treat people of different races, different ethnic groups, or of foreign origin equally?", "Yes, everyone is treated equally / No, some groups are treated worse", "1 = treated equally",
+  "Procedural justice (Module 10, grade 9 only)", "Perceived police effectiveness", "10.2", "If a violent crime or a burglary happened near where you live and the police were called, how quickly do you think they would arrive at the scene?", "0 (extremely slowly) to 10 (extremely quickly)", "0-10",
+  "Procedural justice (Module 10, grade 9 only)", "Legitimacy: duty to obey", "10.6", "To what extent is it your duty to do what the police tell you, even if you don't understand or agree with the reasons?", "0 (not at all my duty) to 10 (completely my duty)", "Standardised; legitimacy = mean of five standardised items",
+  "Procedural justice (Module 10, grade 9 only)", "Legitimacy: moral alignment", "10.7", "The police generally have the same sense of right and wrong as I do.", "agree strongly / agree / neither agree nor disagree / disagree / disagree strongly", "Higher = more agreement; standardised",
+  "Procedural justice (Module 10, grade 9 only)", "Legitimacy: moral alignment", "10.7", "The police are appreciative of how young people think.", "agree strongly / agree / neither agree nor disagree / disagree / disagree strongly", "Higher = more agreement; standardised",
+  "Procedural justice (Module 10, grade 9 only)", "Legitimacy: moral alignment", "10.7", "I generally support how the police usually act.", "agree strongly / agree / neither agree nor disagree / disagree / disagree strongly", "Higher = more agreement; standardised",
+  "Procedural justice (Module 10, grade 9 only)", "Legitimacy: lawfulness", "10.8", "Do you think the police take bribes, and if yes, often?", "0 (never) to 10 (always)", "Reversed (higher = cleaner police); standardised",
+  # ---- institutional anomie (Module 9 and bond items)
+  "Institutional anomie: norm transmission", "Vignette", "9", "Imagine: You own a two year old mobile phone. You convince a class-mate that this old model is great and you do not say that there is a new model that is much better and cheaper. You are able to sell your class-mate your old mobile phone for a price that allows you to buy yourself the brand new model.", "", "",
+  "Institutional anomie: norm transmission", "Expected reaction", "9.1", "IF you did this: How would the following people feel about it? My mother (or stepmother); My father (or stepfather); My favourite teacher", "would admire me for it / ... / neither ... nor / ... / would criticize me for it (five points)", "Rescaled 0-1, higher = stronger disapproval; mother and father averaged",
+  "Institutional anomie: norm transmission", "Bond to parents", "2.1", "I get along just fine with my father (stepfather). I get along just fine with my mother (stepmother). I can easily get emotional support and care from my parents. I would feel very bad disappointing my parents.", "totally agree / rather agree / neither nor / rather disagree / totally disagree; there is no such person", "Mean, rescaled 0-1, higher = stronger bond; 'no such person' = missing",
+  "Institutional anomie: norm transmission", "Bond to teacher", "3.2", "If you had to move to another city, how much would you miss your favourite teacher?", "not at all / not much / only a bit / somewhat / quite a lot / very much", "Mean of 3.2 and 3.3, rescaled 0-1",
+  "Institutional anomie: norm transmission", "Bond to teacher", "3.3", "How important is it to you how your favourite teacher thinks about you?", "totally unimportant / quite unimportant / a bit unimportant / a bit important / quite important / very important", "Mean of 3.2 and 3.3, rescaled 0-1",
+  "Institutional anomie: norm transmission", "Norm transmission", "", "Reaction × bond, computed for parents and for the teacher, then averaged", "", "0-1; split into class mean and within-class deviation",
+  "Institutional anomie: norm transmission", "Sensitivity checks only", "9.1, 5.7-5.9", "Reactions of my best friend, the other people in my class, and other people of my age in my neighbourhood; bond to friends: How much would you miss your friend or group of friends? How important is it to you what your friend or group of friends thinks about you?", "As above; bond items six points", "Best friend weighted by friend bond (0 if no friend group); classmates and neighbourhood peers unweighted",
+  # ---- situational action (Module 6)
+  "Situational action", "Morality", "6.1", "How wrong do you think is it for someone of your age to do the following? Lie, disobey or talk back to adults such as parents and teachers. Knowingly insult someone because of his/her religion, skin colour, or ethnic background. Purposely damage or destroy property that does not belong to you. Illegally download films or music from the internet. Steal something small like a chocolate bar from a shop. Break into a building to steal something. Hit someone with the idea of hurting that person. Use a weapon or force to get money or things from other people.", "very wrong / wrong / a little wrong / not wrong at all", "Mean of eight items, higher = more wrong; downloading model uses the other seven items and the downloading item separately",
+  "Situational action", "Shame: shoplifting", "6.2", "Imagine you were caught shoplifting, would you feel ashamed if ... your best friend / your teacher / your parents found out about it", "no, not at all / yes, a little / yes, very much", "1-3; mean of three items",
+  "Situational action", "Shame: hurting someone", "6.3", "Imagine you were caught physically hurting another person, would you feel ashamed if ... your best friend / your teacher / your parents found out about it", "no, not at all / yes, a little / yes, very much", "1-3; mean of three items",
+  "Situational action", "Shame: being arrested", "6.4", "Imagine you were arrested by the police for committing a crime, would you feel ashamed if ... your best friend / your teacher / your parents found out about it", "no, not at all / yes, a little / yes, very much", "1-3; sensitivity checks only",
+  "Situational action", "Self-control: impulsivity", "6.5", "I act on the spur of the moment without stopping to think. I do whatever brings me pleasure here and now, even at the cost of some future goal. I'm more concerned with what happens to me in the short run than in the long run.", "fully agree / somewhat agree / somewhat disagree / fully disagree", "Self-control = POMP score of nine items (0-100), higher = more self-control",
+  "Situational action", "Self-control: risk-taking", "6.5", "I like to test myself every now and then by doing something a little risky. Sometimes I will take a risk just for the fun of it. Excitement and adventure are more important to me than security.", "fully agree / somewhat agree / somewhat disagree / fully disagree", "Subscale used in sensitivity checks",
+  "Situational action", "Self-control: self-centredness", "6.5", "I try to look out for myself first, even if it means making things difficult for other people. If things I do upset people, it's their problem not mine. I will try to get the things I want even when I know it's causing problems for other people.", "fully agree / somewhat agree / somewhat disagree / fully disagree", "Subscale used in sensitivity checks",
+  # ---- controls
+  "Controls", "Sex", "1.1", "Are you male or female?", "male / female", "1 = male",
+  "Controls", "Family deprivation", "1.14", "How well-off is your family, compared to others? In comparison to most other families that I know, we are ...", "much better off / better off / somewhat better off / the same / somewhat worse off / worse off / much worse off", "1-7, higher = worse off",
+  "Controls", "School bond", "3.1", "If I had to move I would miss my school. Most mornings I like going to school. I like my school. Our classes are interesting.", "I fully agree / I somewhat agree / I somewhat disagree / I fully disagree", "Mean of four items, higher = stronger bond",
+  "Controls", "Delinquent peers", "5.10", "How many friends do you know who have done any of the following? Used soft or hard drugs; stolen things from a shop or department store; entered a building without permission to steal something; threatened somebody with a weapon or beaten someone up, just to get their money or other things; beaten someone up or hurt someone badly with something like a stick or a knife.", "no / yes, number of friends", "Number of the five acts with at least one friend (0-5)",
+  "Controls", "Over age for grade 9", "1.2", "How old are you?", "Years", "1 = older than 15; sensitivity checks only",
+  # ---- honesty checks
+  "Honesty checks", "Fictitious drug", "8.3", "Have you ever used Relevin?", "no / yes", "Screening flag",
+  "Honesty checks", "Non-disclosure", "8.6", "Imagine you had used cannabis (cannabis / marijuana / hash), do you think that you would have said so in this questionnaire?", "I have already said that I have used it / definitely yes / probably yes / probably not / definitely not", "Non-discloser = would not report [check which categories the openness flag uses]",
+  "Honesty checks", "Crosswise question", "12.1", "Question 1: Is your mother's birthday in January, February, or March? Question 2: Did you commit one of the following criminal offenses in the last 12 months? (shoplifting, robbery, assault resulting in an injury, or burglary). If your answers to both questions are the same, tick (A); if they are different, tick (B).", "(A) same / (B) different (grade 9 only)", "Aggregate estimate of prevalence only")
+
+pi_ <- with_panels(items, "group")
+ft_items <- flextable(pi_$df) |>
+  merge_v(j = "Measure") |> valign(j = 1:5, valign = "top", part = "body") |>
+  apa("Table A1. Questionnaire items and response scales", panel_rows = pi_$rows, width = 9, left = 1:5,
+      note = paste("Wording from the ISRD-3 master questionnaire; students answered the Turkish version.",
+                   "Q = question number in the master questionnaire. Response options are listed from the first to the last box.",
+                   "Items were recoded so that higher values mean more of the construct, as stated under Coding.")) |>
+  width(j = 1:5, width = c(1.3, 0.55, 3.75, 1.9, 1.5)) |>
+  paginate(init = TRUE, hdr_ftr = TRUE)                       # do not split a row across pages
+add_tab("a0", ft_items, landscape = TRUE); ft_items
+```
+
+## Appendix Table A2. Robustness of the main associations
+```{r a1}
+alt <- c(LEG_nolaw = "LEG", NTS3_wth = "NTS_wth", NTS3_cls = "NTS_cls")   # substitute measures share a column
+a1_terms <- c("SC", "SHAME_hurt", "MOR", "SHAME_shop", "LEG", "NTS_wth", "NTS_cls")
+fam_of <- \(y) case_when(y %in% c("off_vers", "off_vers_upper") ~ "Versatility (IRR)",
+                         y %in% c("serious_any", "serious_upper", "serious_freq") ~ "Serious offending (OR)",
+                         TRUE ~ NA_character_)
+check_lab <- c(`00` = "Main model", `01` = "Blank offence items counted as offences",
+               `02` = "Non-disclosers excluded", `03a` = "Complete cases (reference)",
+               `03b` = "Complete cases, screened-out cases re-included", `04` = "Without delinquent peers",
+               `05` = "Survey-weighted, single level", `06` = "Serious offending: any serious offence 3+ times",
+               `07` = "Norm and bond parts entered separately", `08` = "Legitimacy without lawfulness",
+               `09` = "Over age for grade 9 added", `10` = "Grades 7–9 (no procedural justice measures)",
+               `10b` = "Grades 7–8", `10c` = "Grade 9 (grades 7–9 sample rules)",
+               `10d` = "Grades 7–9, with class mean × grade 9", `12` = "Three-informant norm transmission",
+               `13` = "Peers' norms added", `14` = "Shame about arrest added", `15` = "Self-control subscales")
+clean_check <- \(x) { code <- str_extract(x, "^\\d+[a-d]?"); unname(coalesce(check_lab[code], x)) }
+
+a1 <- sens |>
+  mutate(term = coalesce(alt[term], term), family = fam_of(outcome)) |>
+  filter(!is.na(family), term %in% a1_terms) |>
+  mutate(cell = paste0(fmt(ratio), " (", fp(p), ")"), order = check) |>
+  select(family, order, check, term, cell) |>
+  pivot_wider(names_from = term, values_from = cell) |>
+  arrange(desc(family), order) |>
+  mutate(Check = clean_check(check)) |>
+  select(family, Check, any_of(a1_terms))
+names(a1)[-(1:2)] <- labv(names(a1)[-(1:2)])
+pa1 <- with_panels(a1, "family")
+fta1 <- flextable(pa1$df) |>
+  apa("Table A2. Robustness of the main associations", panel_rows = pa1$rows, width = 9,
+      note = paste("Cells: IRR or OR per SD (p). Imputed-data checks pool 50 imputations; complete-case and grades 7-9",
+                   "checks use one dataset. Legitimacy without lawfulness and the three-informant norm transmission",
+                   "measure are shown in the legitimacy and norm transmission columns. Empty cell: measure not in that model."))
+add_tab("a1", fta1, landscape = TRUE); fta1
+```
+
+## Appendix Table A3. Additional terms and outcomes in the sensitivity checks
+```{r a2}
+a2 <- sens |>
+  mutate(term = coalesce(alt[term], term), family = fam_of(outcome)) |>
+  # main outcomes: only the extra terms; other outcomes (property, violent): every theory measure
+  filter((!is.na(family) & !term %in% term_order & term %in% names(lab)) |
+         (is.na(family) & term %in% term_order)) |>
+  arrange(check, outcome, factor(term, levels = c(term_order, setdiff(names(lab), term_order)))) |>
+  transmute(Check = clean_check(check), Outcome = labv(outcome), Measure = labv(term),
+            `Ratio [95% CI]` = ci(ratio, lo, hi), p = fp(p))
+fta2 <- flextable(a2) |>
+  merge_v(j = c("Check", "Outcome")) |> valign(j = 1:2, valign = "top") |>
+  apa("Table A3. Additional terms and outcomes in the sensitivity checks", width = 9,
+      note = paste("Terms added in a sensitivity check (versatility and serious offending), and all theory measures for",
+                   "property and violent offending where a check used these outcomes. IRR for versatility, OR for the binary",
+                   "outcomes; per SD for continuous predictors. Procedural fairness, equal treatment and effectiveness",
+                   "in every check are in sensitivity_v2.csv."))
+add_tab("a2", fta2, landscape = TRUE); fta2
+```
+
+## Appendix Table A4. Norm and bond parts of norm transmission (KHB)
+```{r a3}
+a3 <- khb_c |>
+  transmute(outcome = labv(outcome), Part = labv(term), Total = fmt(b_total, 3), Direct = fmt(b_direct, 3),
+            Difference = fmt(diff, 3), `% overlap` = fmt(pct_overlap, 0),
+            Morality = fmt(via_MOR, 3), `Shame: shoplifting` = fmt(via_SHAME_shop, 3),
+            `Shame: hurting` = fmt(via_SHAME_hurt, 3), `Self-control` = fmt(via_SC, 3))
+pa3 <- with_panels(a3, "outcome")
+fta3 <- flextable(pa3$df) |>
+  apa("Table A4. Overlap of the norm and bond parts of norm transmission with the situational action measures",
+      panel_rows = pa3$rows, width = 9,
+      note = "Point estimates averaged over 50 imputations, among students with both parts observed. Log scale.")
+add_tab("a3", fta3, landscape = TRUE); fta3
+```
+
+## Appendix Table A5. Class-level norm transmission and property offending by grade
+```{r a4}
+a4 <- h1g |>
+  transmute(Model = clean_check(check), Measure = labv(term), `OR [95% CI]` = ci(ratio, lo, hi), p = fp(p))
+fta4 <- flextable(a4) |>
+  merge_v(j = "Model") |> valign(j = 1, valign = "top") |>
+  apa("Table A5. Class-level norm transmission and property offending in grades 7-8 and grade 9", left = 1:2,
+      note = paste("Complete-case multilevel logistic models with the institutional anomie and situational action measures",
+                   "(procedural justice items were not asked in grades 7-8). Per SD."))
+add_tab("a4", fta4); fta4
+```
+
+## Appendix Table A6. Separate models, downloading, influence check and E-values
+```{r a5}
+a5a <- sep |> filter(term %in% term_order) |>
+  mutate(cell = ci(ratio, lo, hi), term = factor(term, levels = term_order)) |>
+  select(term, model, cell) |> pivot_wider(names_from = model, values_from = cell) |>
+  arrange(term) |> mutate(term = labv(as.character(term))) |> rename(Measure = term) |>
+  rename(any_of(c(`Property, multilevel` = "property, multilevel",
+                  `Property, Firth (single level)` = "property, Firth (single level)",
+                  `Violent, multilevel` = "violent, multilevel")))
+fta5a <- flextable(a5a) |>
+  apa("Table A6. Property and violent offending in separate models",
+      width = 9, note = paste0("OR [95% CI] per SD. Leaving out one class at a time (", loco$n, " runs), the log-odds ",
+                               "coefficient of class-level norm transmission for property offending ranged from ",
+                               fmt(loco$b_min), " to ", fmt(loco$b_max), " (largest p = ", fp(loco$p_max), ")."))
+
+a5b <- dl |> filter(term %in% c(term_order, "MOR7", "z_prosoc4")) |>
+  transmute(Measure = labv(term), `OR [95% CI]` = ci(ratio, lo, hi), p = fp(p))
+fta5b <- flextable(a5b) |>
+  apa("Table A7. Illegal downloading",
+      note = paste("Full model with the downloading morality item and the seven-item morality scale in place of the",
+                   "eight-item scale. Per SD."))
+
+a5c <- ev |>
+  transmute(Outcome = labv(outcome), Measure = labv(term), Ratio = fmt(ratio),
+            `E-value (estimate)` = fmt(E_point), `E-value (CI limit)` = fmt(E_ci))
+fta5c <- flextable(a5c) |>
+  apa("Table A8. E-values for the main associations", left = 1:2,
+      note = paste("E-value: the minimum risk ratio that an unmeasured confounder would need with both the predictor and",
+                   "the outcome to explain away the estimate (or move its confidence interval to include 1)."))
+add_tab("a5", fta5a, landscape = TRUE); add_tab("a6", fta5b); add_tab("a7", fta5c); fta5a; fta5b; fta5c
+```
+
+## Write all tables to Word
+```{r write}
+doc <- read_docx()
+order <- c("t2a", "t2b", "t3", "t8a",                                    # main Tables 1-3
+           "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",               # Online Tables A1-A8
+           "t1", "t4", "t5", "t6", "t7", "t8b")                          # Online Tables A9-A14
+for (nm in intersect(order, names(tabs))) {
+  t <- tabs[[nm]]
+  doc <- body_add_flextable(doc, t$ft, align = "left")
+  doc <- if (t$landscape) body_end_section_landscape(doc) else body_end_section_portrait(doc)
+}
+out <- here("output", "tables", "manuscript_tables.docx")
+print(doc, target = out)
+out
+```
+
+## Figures
+Figure 1: each theory's measures with the controls only and in the full model (values of Table A10).
+Figure 2: property and violent offending from the stacked model (values of Table A12).
+Saved as PNG (300 dpi) and PDF in output/figures.
+```{r figures, fig.width = 7, fig.height = 5.2}
+# Shared plotting functions for the manuscript figures (forest plots, ratio scale)
+library(ggplot2)
+
+col2  <- c("#2a78d6", "#eb6834")              # validated categorical slots 1-2
+shp2  <- c(16, 17)                            # circle, triangle: second encoding for print/greyscale
+theory_levels <- c("Procedural justice", "Institutional anomie", "Situational action")
+theory_strip  <- c(`Procedural justice` = "Procedural\njustice", `Institutional anomie` = "Institutional\nanomie",
+                   `Situational action` = "Situational\naction")
+
+forest <- function(d, xlab, plabels = NULL, xbreaks = c(0.4, 0.6, 0.8, 1, 1.25, 1.6, 2.5)) {
+  # d: measure, theory, series, panel (optional), ratio, lo, hi
+  d$measure <- factor(d$measure, levels = rev(unique(d$measure)))
+  d$theory  <- factor(d$theory, levels = theory_levels)
+  pd <- position_dodge(width = 0.6)
+  g <- ggplot(d, aes(x = ratio, y = measure, colour = series, shape = series, group = forcats::fct_rev(series))) +
+    geom_vline(xintercept = 1, colour = "grey45", linewidth = 0.4) +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, linewidth = 0.6, position = pd) +
+    geom_point(size = 2.4, position = pd) +
+    scale_x_log10(breaks = xbreaks, labels = function(x) format(x, nsmall = 1, trim = TRUE)) +
+    scale_colour_manual(values = col2, name = NULL) +
+    scale_shape_manual(values = shp2, name = NULL) +
+    labs(x = xlab, y = NULL) +
+    theme_minimal(base_size = 10, base_family = "sans") +
+    theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.3),
+          strip.text.y.left = element_text(angle = 90, face = "bold"),
+          strip.text.x = element_text(face = "bold"), strip.placement = "outside",
+          legend.position = "top", legend.justification = "left",
+          axis.text.y = element_text(colour = "grey15"), plot.margin = margin(5, 10, 5, 5))
+  if ("panel" %in% names(d)) g <- g + facet_grid(theory ~ panel, scales = "free_y", space = "free_y", switch = "y", labeller = labeller(theory = theory_strip))
+  else g <- g + facet_grid(theory ~ ., scales = "free_y", space = "free_y", switch = "y", labeller = labeller(theory = theory_strip))
+  if (!is.null(plabels)) {
+    plabels$measure <- factor(plabels$measure, levels = levels(d$measure))
+    plabels$theory  <- factor(plabels$theory, levels = theory_levels)
+    g <- g + geom_text(data = plabels, aes(x = xpos, y = measure, label = label), inherit.aes = FALSE,
+                       size = 3, colour = "grey20", hjust = 0) +
+      coord_cartesian(clip = "off")
+  }
+  g
+}
+
+dir.create(here("output", "figures"), showWarnings = FALSE)
+fig_terms <- c("LEG","PJ","PJ_EQUAL","EFF","NTS_wth","NTS_cls","MOR","SHAME_shop","SHAME_hurt","SC")
+
+f1 <- bind_rows(alone |> mutate(series = "Theory with controls only"),
+                full  |> mutate(series = "Full model")) |>
+  filter(term %in% fig_terms) |>
+  mutate(term = factor(term, levels = fig_terms)) |> arrange(term) |>
+  transmute(measure = labv(as.character(term)), theory = theory_of(as.character(term)),
+            series = factor(series, levels = c("Theory with controls only", "Full model")),
+            panel = factor(ifelse(outcome == "off_vers", "Versatility (IRR)", "Serious offending (OR)"),
+                           levels = c("Versatility (IRR)", "Serious offending (OR)")),
+            ratio, lo, hi)
+g1 <- forest(f1, "Rate ratio or odds ratio per SD (log scale)")
+ggsave(here("output", "figures", "Figure1.png"), g1, width = 7, height = 5.2, dpi = 300, bg = "white")
+ggsave(here("output", "figures", "Figure1.pdf"), g1, width = 7, height = 5.2, bg = "white")
+g1
+
+f2 <- t_slope |> filter(mechanism %in% fig_terms) |>
+  mutate(mechanism = factor(mechanism, levels = fig_terms)) |> arrange(mechanism) |>
+  transmute(measure = labv(as.character(mechanism)), theory = theory_of(as.character(mechanism)),
+            series = factor(ifelse(type == "property", "Property offending", "Violent offending"),
+                            levels = c("Property offending", "Violent offending")),
+            ratio, lo, hi)
+x_p <- 1.15 * max(f2$hi)
+pl <- t_diff |> filter(mechanism %in% fig_terms) |>
+  transmute(measure = labv(mechanism), theory = theory_of(mechanism), xpos = x_p, label = paste("p =", fp(p)))
+g2 <- forest(f2, "Odds ratio per SD (log scale)", plabels = pl) +
+  geom_text(data = data.frame(theory = factor("Procedural justice", levels = theory_levels), x = x_p, y = Inf),
+            aes(x = x, y = y, label = "Difference"), inherit.aes = FALSE, hjust = 0, vjust = -0.6, size = 3, fontface = "bold") +
+  theme(plot.margin = margin(5, 60, 5, 5))
+ggsave(here("output", "figures", "Figure2.png"), g2, width = 7, height = 4.6, dpi = 300, bg = "white")
+ggsave(here("output", "figures", "Figure2.pdf"), g2, width = 7, height = 4.6, bg = "white")
+g2
+```
